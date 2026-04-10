@@ -1,21 +1,26 @@
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import numpy.typing as npt
 import pytest
 
 from semble import SembleIndex
+
+_MODEL_NAME = "test/mock-model"
 
 
 @pytest.fixture
 def index(mock_model: Any) -> SembleIndex:
     """SembleIndex backed by the deterministic mock encoder."""
-    return SembleIndex(model=mock_model)
+    return SembleIndex(model=mock_model, enable_caching=False)
 
 
 @pytest.fixture
 def indexed_index(mock_model: Any, tmp_project: Path) -> SembleIndex:
     """SembleIndex built from tmp_project via the primary constructor."""
-    return SembleIndex.from_path(tmp_project, model=mock_model)
+    return SembleIndex.from_path(tmp_project, model=mock_model, enable_caching=False)
 
 
 def test_index_returns_stats(index: SembleIndex, tmp_project: Path) -> None:
@@ -90,12 +95,76 @@ def test_search_no_duplicate_chunks(indexed_index: SembleIndex) -> None:
 def test_reindex_does_not_re_embed(indexed_index: SembleIndex, tmp_project: Path, mock_model: Any) -> None:
     """Re-indexing unchanged files does not call encode again."""
     call_count_after_first = mock_model.encode.call_count
-
     indexed_index.index(tmp_project)
-
     assert mock_model.encode.call_count == call_count_after_first
 
 
 def test_stats_property(indexed_index: SembleIndex) -> None:
     """Stats property reflects the most recent index call."""
     assert indexed_index.stats.indexed_files >= 2
+
+
+def test_disk_cache_round_trip(mock_model: Any, tmp_project: Path, tmp_path: Path) -> None:
+    """from_path writes .npy files on first run and avoids re-encoding on second."""
+    cache_dir = tmp_path / "cache"
+
+    first = SembleIndex.from_path(tmp_project, model=mock_model, cache_dir=cache_dir, model_name=_MODEL_NAME)
+    assert list(cache_dir.rglob("*.npy"))
+    encode_calls = mock_model.encode.call_count
+
+    second = SembleIndex.from_path(tmp_project, model=mock_model, cache_dir=cache_dir, model_name=_MODEL_NAME)
+    assert mock_model.encode.call_count == encode_calls
+    assert len(second.chunks) == len(first.chunks)
+
+
+def test_disk_cache_encodes_only_new_chunks(mock_model: Any, tmp_project: Path, tmp_path: Path) -> None:
+    """Adding a file triggers encode only for the new chunks."""
+    cache_dir = tmp_path / "cache"
+
+    first = SembleIndex(model=mock_model, cache_dir=cache_dir, model_name=_MODEL_NAME)
+    first.index(tmp_project)
+    calls_after_first = mock_model.encode.call_count
+
+    (tmp_project / "new_module.py").write_text("def new_func(): pass\n")
+
+    second = SembleIndex(model=mock_model, cache_dir=cache_dir, model_name=_MODEL_NAME)
+    second.index(tmp_project)
+
+    assert mock_model.encode.call_count == calls_after_first + 1
+
+
+def test_disk_cache_model_name_isolates_models(mock_model: Any, tmp_project: Path, tmp_path: Path) -> None:
+    """Different model_name values write to separate subdirectories."""
+    cache_dir = tmp_path / "cache"
+
+    SembleIndex(model=mock_model, cache_dir=cache_dir, model_name="org/model-a").index(tmp_project)
+    SembleIndex(model=mock_model, cache_dir=cache_dir, model_name="org/model-b").index(tmp_project)
+
+    namespaces = {p.name for p in cache_dir.iterdir() if p.is_dir()}
+    assert "org--model-a" in namespaces
+    assert "org--model-b" in namespaces
+
+
+def test_disk_cache_tilde_expansion(mock_model: Any, tmp_project: Path, monkeypatch: Any) -> None:
+    """cache_dir values containing ~ are expanded to the real home directory."""
+    fake_home = tmp_project / "fakehome"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    SembleIndex(model=mock_model, cache_dir="~/semble-cache", model_name=_MODEL_NAME).index(tmp_project)
+
+    assert list((fake_home / "semble-cache").rglob("*.npy"))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"enable_caching": False, "model_name": _MODEL_NAME},
+        {"enable_caching": True},  # custom model, no model_name → silently disabled
+    ],
+)
+def test_disk_cache_disabled(mock_model: Any, tmp_project: Path, kwargs: dict[str, Any]) -> None:
+    """Disk caching is disabled both when explicitly turned off and when model_name is absent."""
+    idx = SembleIndex(model=mock_model, **kwargs)
+    assert idx.cache_dir is None
+    assert idx.cache_namespace is None

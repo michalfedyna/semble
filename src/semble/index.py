@@ -8,6 +8,7 @@ import numpy as np
 from model2vec import StaticModel
 from vicinity import Metric, Vicinity
 
+from semble.cache import EmbeddingCache
 from semble.chunker import chunk_source
 from semble.search import search_bm25, search_hybrid, search_semantic
 from semble.sources import language_for_path, resolve_extensions, walk_files
@@ -20,14 +21,24 @@ _DEFAULT_MODEL_NAME = "Pringled/potion-code-16M"
 class SembleIndex:
     """Fast local code index with hybrid search."""
 
-    def __init__(self, model: Encoder | None = None) -> None:
-        """Initialize a SembleIndex."""
-        self.model = model
-        self._chunks: list[Chunk] = []
+    def __init__(
+        self,
+        model: Encoder | None = None,
+        *,
+        enable_caching: bool = True,
+        cache_dir: str | Path | None = None,
+        model_name: str | None = None,
+    ) -> None:
+        """Initialize a SembleIndex instance."""
+        self.model: Encoder | None = model
+        self.cache_dir, self.cache_namespace = self._resolve_cache_config(
+            model, enable_caching=enable_caching, cache_dir=cache_dir, model_name=model_name
+        )
+        self.chunks: list[Chunk] = []
+        self.stats = IndexStats()
         self._embedding_cache: dict[str, EmbeddingMatrix] = {}
         self._bm25_index: bm25s.BM25 | None = None
         self._semantic_index: Vicinity | None = None
-        self._stats = IndexStats()
 
     @classmethod
     def from_path(
@@ -37,17 +48,23 @@ class SembleIndex:
         extensions: frozenset[str] | None = None,
         ignore: frozenset[str] | None = None,
         include_docs: bool = False,
+        enable_caching: bool = True,
+        cache_dir: str | Path | None = None,
+        model_name: str | None = None,
     ) -> SembleIndex:
-        """Create a SembleIndex index from a directory.
+        """Create and index a SembleIndex from a directory.
 
         :param path: Root directory to index.
-        :param model: Embedding model to use. Defaults to ``Pringled/potion-code-16M``.
-        :param extensions: File extensions to include. Defaults to all code extensions.
-        :param ignore: Directory names to skip. Defaults to the standard ignored directories.
+        :param model: Embedding model to use. Defaults to potion-code-16M.
+        :param extensions: File extensions to include. Defaults to a standard set of code extensions.
+        :param ignore: Directory names to skip. Defaults to common VCS and build dirs.
         :param include_docs: If True, also index documentation files (.md, .yaml, etc.).
+        :param enable_caching: Whether to persist embeddings to disk between runs.
+        :param cache_dir: Override the cache directory. Defaults to ~/.cache/semble.
+        :param model_name: Stable identifier for a custom encoder, used as the disk cache namespace.
         :return: An indexed SembleIndex.
         """
-        instance = cls(model=model)
+        instance = cls(model=model, enable_caching=enable_caching, cache_dir=cache_dir, model_name=model_name)
         instance.index(path, extensions=extensions, ignore=ignore, include_docs=include_docs)
         return instance
 
@@ -58,7 +75,14 @@ class SembleIndex:
         ignore: frozenset[str] | None = None,
         include_docs: bool = False,
     ) -> IndexStats:
-        """Index a directory."""
+        """Index a directory using the backend configured at construction time.
+
+        :param path: Root directory to index.
+        :param extensions: File extensions to include.
+        :param ignore: Directory names to skip.
+        :param include_docs: If True, also index documentation files.
+        :return: Statistics about the indexed files and chunks.
+        """
         path = Path(path).resolve()
         extensions = resolve_extensions(extensions, include_docs=include_docs)
 
@@ -77,23 +101,22 @@ class SembleIndex:
                     if chunk.language:
                         language_counts[chunk.language] = language_counts.get(chunk.language, 0) + 1
 
-        self._chunks = all_chunks
+        self.chunks = all_chunks
 
         if all_chunks:
-            model = self._ensure_model()
-            embeddings = self._embed_chunks(model, all_chunks)
+            embeddings = self._embed_chunks(all_chunks)
             self._bm25_index = self._build_bm25_index(all_chunks)
             self._semantic_index = self._build_semantic_index(embeddings, all_chunks)
         else:
             self._bm25_index = None
             self._semantic_index = None
 
-        self._stats = IndexStats(
+        self.stats = IndexStats(
             indexed_files=indexed_files,
             total_chunks=len(all_chunks),
             languages=language_counts,
         )
-        return self._stats
+        return self.stats
 
     def search(
         self,
@@ -111,47 +134,74 @@ class SembleIndex:
         :return: Ranked list of :class:`SearchResult` objects, best match first.
         :raises ValueError: If ``mode`` is not a recognised search strategy.
         """
-        model, bm25_index, semantic_index = self.model, self._bm25_index, self._semantic_index
-        if not self._chunks or model is None or bm25_index is None or semantic_index is None:
+        bm25_index, semantic_index = self._bm25_index, self._semantic_index
+        if not self.chunks or bm25_index is None or semantic_index is None:
             return []
 
+        if mode == SearchMode.BM25:
+            return search_bm25(query, bm25_index, self.chunks, top_k)
+
+        model = self._ensure_model()
         if mode == SearchMode.SEMANTIC:
             return search_semantic(query, model, semantic_index, top_k)
-        if mode == SearchMode.BM25:
-            return search_bm25(query, bm25_index, self._chunks, top_k)
         if mode == SearchMode.HYBRID:
-            return search_hybrid(query, model, semantic_index, bm25_index, self._chunks, top_k, alpha=alpha)
+            return search_hybrid(query, model, semantic_index, bm25_index, self.chunks, top_k, alpha=alpha)
         raise ValueError(f"Unknown search mode: {mode!r}")
 
-    @property
-    def chunks(self) -> list[Chunk]:
-        """Return the indexed chunks from the last call to index."""
-        return self._chunks
-
-    @property
-    def stats(self) -> IndexStats:
-        """Return indexing statistics from the last call to index."""
-        return self._stats
+    @staticmethod
+    def _resolve_cache_config(
+        model: Encoder | None,
+        *,
+        enable_caching: bool,
+        cache_dir: str | Path | None,
+        model_name: str | None,
+    ) -> tuple[Path | None, str | None]:
+        """Determine cache directory and namespace based on constructor args."""
+        if not enable_caching:
+            return None, None
+        root = Path(cache_dir).expanduser() if cache_dir is not None else Path.home() / ".cache" / "semble"
+        if model is None:
+            return root, _DEFAULT_MODEL_NAME
+        if model_name is not None:
+            return root, model_name
+        return None, None
 
     def _ensure_model(self) -> Encoder:
-        """Return the current model, loading the default if none was provided."""
+        """Return the current model, loading the default if none was provided.
+
+        :return: The active encoder.
+        """
         if self.model is None:
-            model = StaticModel.from_pretrained(_DEFAULT_MODEL_NAME)
-            self.model = model
-            return model
+            self.model = StaticModel.from_pretrained(_DEFAULT_MODEL_NAME)
         return self.model
 
-    def _embed_chunks(self, model: Encoder, chunks: list[Chunk]) -> EmbeddingMatrix:
-        """Embed chunks, reusing cached embeddings when available."""
+    def _embed_chunks(self, chunks: list[Chunk]) -> EmbeddingMatrix:
+        """Embed chunks, consulting memory then disk before calling the model.
+
+        Lookup order: in-memory cache → disk cache → encode. The model is loaded
+        (or downloaded) only when there are genuine cache misses.
+
+        :param chunks: Chunks to embed.
+        :return: Matrix of embeddings, one row per chunk, in input order.
+        """
         if not chunks:
             return np.empty((0, 256), dtype=np.float32)
-        uncached = [
-            (i, chunk.content) for i, chunk in enumerate(chunks) if chunk.content_hash not in self._embedding_cache
-        ]
-        if uncached:
-            indices, texts = zip(*uncached, strict=True)
-            for i, embedding in zip(indices, model.encode(list(texts)), strict=True):
-                self._embedding_cache[chunks[i].content_hash] = embedding
+
+        cache = EmbeddingCache(self._embedding_cache, self.cache_dir, self.cache_namespace)
+
+        miss_indices: list[int] = []
+        miss_texts: list[str] = []
+
+        for i, chunk in enumerate(chunks):
+            if cache.get(chunk.content_hash) is None:
+                miss_indices.append(i)
+                miss_texts.append(chunk.content)
+
+        if miss_indices:
+            model = self._ensure_model()
+            for i, embedding in zip(miss_indices, model.encode(miss_texts), strict=True):
+                cache.put(chunks[i].content_hash, embedding)
+
         return np.array([self._embedding_cache[chunk.content_hash] for chunk in chunks], dtype=np.float32)
 
     def _build_bm25_index(self, chunks: list[Chunk]) -> bm25s.BM25:
