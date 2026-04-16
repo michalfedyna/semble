@@ -2,10 +2,10 @@ import contextlib
 from pathlib import Path
 
 import bm25s
-from vicinity import Metric, Vicinity
+from vicinity.backends.basic import BasicArgs
 
 from semble.index.chunker import chunk_source
-from semble.index.dense import embed_chunks
+from semble.index.dense import SelectableBasicBackend, embed_chunks
 from semble.index.file_walker import filter_extensions, language_for_path, walk_files
 from semble.index.sparse import enrich_for_bm25
 from semble.tokens import tokenize
@@ -19,7 +19,7 @@ def create_index_from_path(
     ignore: frozenset[str] | None = None,
     include_docs: bool = False,
     display_root: Path | None = None,
-) -> tuple[bm25s.BM25, Vicinity, list[Chunk]]:
+) -> tuple[bm25s.BM25, SelectableBasicBackend, list[Chunk]]:
     """Create an index from a resolved directory, optionally storing chunk paths relative to display_root.
 
     :param path: Resolved absolute path to index.
@@ -49,7 +49,8 @@ def create_index_from_path(
             [tokenize(enrich_for_bm25(chunk, display_root or path)) for chunk in chunks],
             show_progress=False,
         )
-        semantic_index = Vicinity.from_vectors_and_items(embeddings, chunks, metric=Metric.COSINE)
+        args = BasicArgs()
+        semantic_index = SelectableBasicBackend(embeddings, args)
     else:
         raise ValueError("Unable to create index.")
 
