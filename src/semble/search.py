@@ -4,7 +4,7 @@ import numpy.typing as npt
 
 from semble.index.dense import SelectableBasicBackend
 from semble.index.sparse import selector_to_mask
-from semble.ranking import apply_query_boost, rerank_topk, resolve_alpha
+from semble.ranking import apply_query_boost, boost_multi_chunk_files, rerank_topk, resolve_alpha
 from semble.tokens import tokenize
 from semble.types import Chunk, Encoder, SearchMode, SearchResult
 
@@ -92,7 +92,6 @@ def search_hybrid(
     alpha_weight = resolve_alpha(query, alpha)
 
     # Over-fetch candidates so the merged pool is large enough after union and re-ranking.
-    # 5x is sufficient; latency difference vs larger multipliers is negligible.
     candidate_count = top_k * 5
 
     semantic = search_semantic(query, model, semantic_index, chunks, candidate_count, selector)
@@ -111,7 +110,10 @@ def search_hybrid(
         for chunk in set(normalized_semantic) | set(normalized_bm25)
     }
 
+    # Boost files with multiple relevant chunks.
+    boost_multi_chunk_files(combined_scores)
+    # Boost queries with specific identifiers in them.
     combined_scores = apply_query_boost(combined_scores, query, chunks)
-
+    # Rerank the top-k results by applying path-based penalties.
     ranked = rerank_topk(combined_scores, top_k, penalise_paths=alpha_weight < 1.0)
     return [SearchResult(chunk=chunk, score=score, source=SearchMode.HYBRID) for chunk, score in ranked]

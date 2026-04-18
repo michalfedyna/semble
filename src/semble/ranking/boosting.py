@@ -1,36 +1,45 @@
+import functools
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 from semble.tokens import _split_identifier
 from semble.types import Chunk
 
-# Matches queries that look like symbol lookups. A query is treated as a symbol if it:
-#   - is namespace-qualified (e.g. Sinatra::Base, self->field, a.b)
-#   - starts with an underscore (e.g. _private, __init__)
-#   - contains an uppercase letter or underscore (e.g. HTTPAdapter, field_validator, getUser)
-#   - starts with an uppercase letter (e.g. URL, Base)
-# Purely lowercase single words (e.g. "session", "response") are NOT matched —
-# those are natural language queries that should use semantic search.
+# Symbol-lookup queries: namespace-qualified, leading-underscore, or containing
+# uppercase/underscore. Plain lowercase words (e.g. "session") are NL, not symbols.
 _SYMBOL_QUERY_RE = re.compile(
     r"^(?:"
     r"[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\\|->|\.)[A-Za-z_][A-Za-z0-9_]*)+"  # namespace-qualified
-    r"|_[A-Za-z0-9_]*"  # leading underscore (_private, __init__)
-    r"|[A-Za-z][A-Za-z0-9]*[A-Z_][A-Za-z0-9_]*"  # contains uppercase or underscore after pos 0
-    r"|[A-Z][A-Za-z0-9]*"  # starts with uppercase (URL, Base, HTTPAdapter)
+    r"|_[A-Za-z0-9_]*"  # leading underscore
+    r"|[A-Za-z][A-Za-z0-9]*[A-Z_][A-Za-z0-9_]*"  # contains uppercase or underscore
+    r"|[A-Z][A-Za-z0-9]*"  # starts with uppercase
     r")$"
 )
 
-# Alpha values for query-adaptive blending.
-_ALPHA_SYMBOL = 0.3  # Symbol queries: lean BM25 for exact keyword matching
-_ALPHA_NL = 0.5  # Natural language queries: balanced semantic + BM25
+# CamelCase/camelCase identifiers embedded in a NL query; excludes plain words and pure acronyms.
+_EMBEDDED_SYMBOL_RE = re.compile(
+    r"\b(?:"
+    r"[A-Z][a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*"  # PascalCase
+    r"|[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]+"  # camelCase
+    r")\b"
+)
 
-# Definition keywords used across common languages.
-# Case-sensitive: most language keywords are lowercase by convention, and applying
-# IGNORECASE globally causes false positive boosts (e.g. "Module" in Python docs,
-# "Class" method calls in Ruby).
+# Minimum stem length for prefix-based non-candidate scan (avoids over-broad matches).
+_EMBEDDED_STEM_MIN_LEN = 4
+
+# Half-strength: the symbol may be incidental to the NL query.
+_EMBEDDED_SYMBOL_BOOST_SCALE = 0.5
+
+_ALPHA_SYMBOL = 0.3  # lean BM25 for exact keyword matching
+_ALPHA_NL = 0.5  # balanced semantic + BM25
+
+# Case-sensitive: IGNORECASE produces false positives like "Module" in Python docs
+# or "Class" method calls in Ruby.
 _DEFINITION_KEYWORDS = (
     "class",
     "module",
+    "defmodule",  # Elixir
     "def",
     "interface",
     "struct",
@@ -48,11 +57,10 @@ _DEFINITION_KEYWORDS = (
     "namespace",
     "protocol",  # Swift
     "record",  # C# 9+, Java 16+
-    "typedef",  # C/C++/Dart: `typedef struct Foo Foo`
+    "typedef",  # C/C++/Dart
 )
 
-# SQL DDL keywords matched case-insensitively (SQL is commonly written in either
-# all-caps or all-lowercase; mixing with IGNORECASE avoids duplicating entries).
+# SQL DDL is conventionally all-caps or all-lowercase; match both via IGNORECASE.
 _SQL_DEFINITION_KEYWORDS = (
     "CREATE TABLE",
     "CREATE VIEW",
@@ -60,18 +68,18 @@ _SQL_DEFINITION_KEYWORDS = (
     "CREATE FUNCTION",
 )
 
-# Precompiled alternation bodies — the fixed part of each pattern.
-# Only symbol_name changes per call; re.escape(symbol_name) is substituted
-# into the suffix at call time.
 _KEYWORD_PREFIX = r"(?:^|(?<=\s))(?:"
 _DEFINITION_KEYWORD_BODY = "|".join(re.escape(keyword) for keyword in _DEFINITION_KEYWORDS)
 _SQL_KEYWORD_BODY = "|".join(re.escape(keyword) for keyword in _SQL_DEFINITION_KEYWORDS)
 
 # Additive boost multiplier for chunks that define a queried symbol.
-_DEFINITION_BOOST_MULTIPLIER = 2.0
+_DEFINITION_BOOST_MULTIPLIER = 3.0
 
 # Additive boost multiplier for NL queries when file stems match query words.
 _STEM_BOOST_MULTIPLIER = 1.0
+
+# Fraction of max_score added to each file's top chunk, scaled by its aggregate candidate score.
+_FILE_COHERENCE_BOOST_FRAC = 0.2
 
 # Common English stopwords excluded from file-stem matching for NL queries.
 _STOPWORDS = frozenset(
@@ -92,16 +100,7 @@ def apply_query_boost(
     query: str,
     all_chunks: list[Chunk],
 ) -> dict[Chunk, float]:
-    """Apply query-type-specific boosts to candidate scores.
-
-    Dispatches to symbol-definition boosting or NL file-stem boosting
-    based on query type.
-
-    :param combined_scores: Existing combined scores for candidate chunks.
-    :param query: The raw query string.
-    :param all_chunks: The full chunk list (used for non-candidate definition scanning).
-    :return: Updated scores dict with boosts applied.
-    """
+    """Apply query-type boosts to candidate scores."""
     if not combined_scores:
         return combined_scores
 
@@ -112,8 +111,32 @@ def apply_query_boost(
         _boost_symbol_definitions(boosted, query, max_score, all_chunks)
     else:
         _boost_stem_matches(boosted, query, max_score)
+        _boost_embedded_symbols(boosted, query, max_score, all_chunks)
 
     return boosted
+
+
+def boost_multi_chunk_files(scores: dict[Chunk, float]) -> None:
+    """Promote files with multiple high-scoring chunks by boosting their top chunk (in-place)."""
+    if not scores:
+        return
+
+    max_score = max(scores.values())
+    if max_score == 0.0:
+        return
+
+    file_sum: dict[str, float] = {}
+    best_chunk: dict[str, Chunk] = {}
+    for chunk, score in scores.items():
+        file_path = chunk.file_path
+        file_sum[file_path] = file_sum.get(file_path, 0.0) + score
+        if file_path not in best_chunk or score > scores[best_chunk[file_path]]:
+            best_chunk[file_path] = chunk
+
+    max_file_sum = max(file_sum.values())
+    boost_unit = max_score * _FILE_COHERENCE_BOOST_FRAC
+    for file_path, chunk in best_chunk.items():
+        scores[chunk] += boost_unit * file_sum[file_path] / max_file_sum
 
 
 def _is_symbol_query(query: str) -> bool:
@@ -132,40 +155,56 @@ def _extract_symbol_name(query: str) -> str:
     return query.strip()
 
 
-def _chunk_defines_symbol(chunk: Chunk, symbol_name: str) -> bool:
-    """Check whether a chunk contains a definition of *symbol_name*.
-
-    Two passes: case-sensitive for general keywords (to avoid false positives
-    from e.g. `Module.new` in Ruby or `Class` in docstrings), then
-    case-insensitive for SQL DDL keywords where mixed-case is common.
-    """
-    escaped_symbol = re.escape(symbol_name)
-    suffix = r")\s+" + escaped_symbol + r"(?:\s|[<({:\[;]|$)"
-    if re.compile(_KEYWORD_PREFIX + _DEFINITION_KEYWORD_BODY + suffix, re.MULTILINE).search(chunk.content) is not None:
-        return True
+@functools.lru_cache(maxsize=256)
+def _definition_pattern(symbol_name: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    escaped = re.escape(symbol_name)
+    ns_prefix = r"(?:[A-Za-z_][A-Za-z0-9_]*(?:\.|::))*"
+    suffix = r")\s+" + ns_prefix + escaped + r"(?:\s|[<({:\[;]|$)"
     return (
-        re.compile(_KEYWORD_PREFIX + _SQL_KEYWORD_BODY + suffix, re.MULTILINE | re.IGNORECASE).search(chunk.content)
-        is not None
+        re.compile(_KEYWORD_PREFIX + _DEFINITION_KEYWORD_BODY + suffix, re.MULTILINE),
+        re.compile(_KEYWORD_PREFIX + _SQL_KEYWORD_BODY + suffix, re.MULTILINE | re.IGNORECASE),
     )
 
 
-def _file_stem_matches_symbol(chunk: Chunk, symbol_name: str) -> bool:
-    """Return True if the chunk's file stem matches the symbol name (case-insensitive, snake_case/PascalCase-aware)."""
-    stem = Path(chunk.file_path).stem.lower()
-    return stem == symbol_name.lower() or stem.replace("_", "") == symbol_name.lower()
+def _chunk_defines_symbol(chunk: Chunk, symbol_name: str) -> bool:
+    """Return True if the chunk contains a definition of *symbol_name*.
+
+    Case-sensitive for general keywords, case-insensitive for SQL DDL.
+    Also matches namespace-qualified forms (e.g. ``defmodule Phoenix.Router`` for ``Router``).
+    """
+    general, sql = _definition_pattern(symbol_name)
+    return general.search(chunk.content) is not None or sql.search(chunk.content) is not None
+
+
+def _stem_matches(stem: str, name: str) -> bool:
+    """Return True if *stem* matches *name* (exact, snake_case-normalised, or plural)."""
+    stem_norm = stem.replace("_", "")
+    return stem == name or stem_norm == name or stem.rstrip("s") == name or stem_norm.rstrip("s") == name
 
 
 def _definition_tier(chunk: Chunk, names: set[str], boost_unit: float) -> float:
-    """Return the boost amount for a chunk that defines one of *names*.
-
-    Tier 1.5 x boost_unit if the file stem also matches (strong signal).
-    Tier 1.0 x boost_unit for definition keyword match alone.
-    Returns 0.0 if the chunk does not define any of *names*.
-    """
+    """Return the boost amount for a chunk that defines one of *names* (0.0 if none match)."""
     if not any(_chunk_defines_symbol(chunk, name) for name in names):
         return 0.0
-    has_stem = any(_file_stem_matches_symbol(chunk, name) for name in names)
-    return boost_unit * (1.5 if has_stem else 1.0)
+    stem = Path(chunk.file_path).stem.lower()
+    return boost_unit * (1.5 if any(_stem_matches(stem, name.lower()) for name in names) else 1.0)
+
+
+def _scan_non_candidates(
+    boosted: dict[Chunk, float],
+    names: set[str],
+    boost_unit: float,
+    all_chunks: list[Chunk],
+    stem_ok: Callable[[str], bool],
+) -> None:
+    """Boost non-candidate chunks whose lowercased file stem satisfies stem_ok (in-place)."""
+    for chunk in all_chunks:
+        if chunk in boosted:
+            continue
+        if not stem_ok(Path(chunk.file_path).stem.lower()):
+            continue
+        if tier := _definition_tier(chunk, names, boost_unit):
+            boosted[chunk] = tier
 
 
 def _boost_symbol_definitions(
@@ -174,17 +213,7 @@ def _boost_symbol_definitions(
     max_score: float,
     all_chunks: list[Chunk],
 ) -> None:
-    """Boost chunks that define the queried symbol (in-place).
-
-    Scans both candidates and non-candidates whose file stem matches the
-    symbol.  Non-candidate scanning is needed for large repos where the
-    definition file may not rank in the top-N candidates despite BM25 stem
-    enrichment.
-
-    Definition tiers (see `_definition_tier`):
-      - 1.5x boost_unit: definition keyword + file-stem match
-      - 1.0x boost_unit: definition keyword only
-    """
+    """Boost chunks that define the queried symbol, scanning candidates and stem-matched non-candidates (in-place)."""
     symbol_name = _extract_symbol_name(query)
     if not symbol_name:
         return
@@ -196,26 +225,58 @@ def _boost_symbol_definitions(
     boost_unit = max_score * _DEFINITION_BOOST_MULTIPLIER
 
     for chunk in list(boosted):
-        tier = _definition_tier(chunk, names, boost_unit)
-        if tier:
+        if tier := _definition_tier(chunk, names, boost_unit):
             boosted[chunk] += tier
 
-    # Scan non-candidate chunks whose file stem matches the symbol.
-    # In large repos the definition file may not rank in the top-N candidates
-    # despite BM25 stem enrichment; scanning by stem ensures it is found.
-    symbol_lower = symbol_name.lower()
+    _scan_non_candidates(
+        boosted,
+        names,
+        boost_unit,
+        all_chunks,
+        lambda stem: _stem_matches(stem, symbol_name.lower()),
+    )
+
+
+def _boost_embedded_symbols(
+    boosted: dict[Chunk, float],
+    query: str,
+    max_score: float,
+    all_chunks: list[Chunk],
+) -> None:
+    """Boost chunks defining CamelCase/camelCase symbols embedded in NL queries (in-place).
+
+    Half-strength vs pure symbol queries. Non-candidate scan uses stem-prefix match
+    so e.g. ``state.ts`` is found for symbol ``StateManager``.
+    """
+    names = set(_EMBEDDED_SYMBOL_RE.findall(query))
+    if not names:
+        return
+
+    boost_unit = max_score * _DEFINITION_BOOST_MULTIPLIER * _EMBEDDED_SYMBOL_BOOST_SCALE
+
+    for chunk in list(boosted):
+        if tier := _definition_tier(chunk, names, boost_unit):
+            boosted[chunk] += tier
+
+    symbols_lower = frozenset(s.lower() for s in names)
     for chunk in all_chunks:
         if chunk in boosted:
             continue
         stem = Path(chunk.file_path).stem.lower()
-        if stem != symbol_lower and stem.replace("_", "") != symbol_lower:
+        stem_norm = stem.replace("_", "")
+        if not any(
+            stem == symbol_lower
+            or stem_norm == symbol_lower
+            or (len(stem) >= _EMBEDDED_STEM_MIN_LEN and symbol_lower.startswith(stem))
+            or (len(stem_norm) >= _EMBEDDED_STEM_MIN_LEN and symbol_lower.startswith(stem_norm))
+            for symbol_lower in symbols_lower
+        ):
             continue
-        tier = _definition_tier(chunk, names, boost_unit)
-        if tier:
+        if tier := _definition_tier(chunk, names, boost_unit):
             boosted[chunk] = tier
 
 
-def _fuzzy_keyword_overlap(keywords: set[str], parts: set[str]) -> int:
+def _count_keyword_matches(keywords: set[str], parts: set[str]) -> int:
     """Count query keywords that match path parts, allowing prefix overlap (min 3 chars)."""
     exact = keywords & parts
     if len(exact) == len(keywords):
@@ -257,7 +318,7 @@ def _boost_stem_matches(
             if path.parent.name and path.parent.name not in (".", "/", ".."):
                 parts.update(_split_identifier(path.parent.name))
             path_cache[chunk.file_path] = parts
-        n_matches = _fuzzy_keyword_overlap(keywords, path_cache[chunk.file_path])
+        n_matches = _count_keyword_matches(keywords, path_cache[chunk.file_path])
         if n_matches > 0:
             match_ratio = n_matches / len(keywords)
             if match_ratio >= 0.10:
