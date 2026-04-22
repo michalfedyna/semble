@@ -1,4 +1,5 @@
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import bm25s
 import numpy as np
@@ -6,10 +7,10 @@ import numpy.typing as npt
 import pytest
 from vicinity.backends.basic import BasicArgs
 
-from semble.index.dense import SelectableBasicBackend
+from semble.index.dense import SelectableBasicBackend, embed_chunks, load_model
 from semble.search import _sort_top_k, search_bm25, search_hybrid, search_semantic
 from semble.tokens import tokenize
-from semble.types import Chunk, SearchMode
+from semble.types import Chunk, Encoder, SearchMode
 from tests.conftest import make_chunk
 
 
@@ -48,17 +49,21 @@ def semantic(embeddings: npt.NDArray[np.float32]) -> SelectableBasicBackend:
     return SelectableBasicBackend(embeddings, BasicArgs())
 
 
-def test_bm25_search(bm25: bm25s.BM25, chunks: list[Chunk]) -> None:
-    """BM25 returns results with the most relevant chunk first."""
+def test_search_bm25(bm25: bm25s.BM25, chunks: list[Chunk]) -> None:
+    """search_bm25: returns most relevant chunk first; selector restricts to given indices."""
     results = search_bm25("authenticate token", bm25, chunks, top_k=4, selector=None)
     assert len(results) > 0
     assert "authenticate" in results[0].chunk.content
 
+    selector = np.array([len(chunks) - 1], dtype=np.int_)
+    filtered = search_bm25("format", bm25, chunks, top_k=4, selector=selector)
+    assert all(r.chunk is chunks[len(chunks) - 1] for r in filtered)
 
-def test_bm25_no_results_for_garbage(bm25: bm25s.BM25, chunks: list[Chunk]) -> None:
-    """Query with no matching tokens returns an empty list."""
-    results = search_bm25("zzzznonexistentterm", bm25, chunks, top_k=3, selector=None)
-    assert results == []
+
+@pytest.mark.parametrize("query", ["", "   ", "\n\n", "zzzznonexistentterm"])
+def test_bm25_returns_empty_for_no_match(bm25: bm25s.BM25, chunks: list[Chunk], query: str) -> None:
+    """Empty / whitespace-only / token-less queries return [] instead of crashing bm25s."""
+    assert search_bm25(query, bm25, chunks, top_k=3, selector=None) == []
 
 
 def test_semantic_search(semantic: SelectableBasicBackend, chunks: list[Chunk], mock_model: Any) -> None:
@@ -68,16 +73,13 @@ def test_semantic_search(semantic: SelectableBasicBackend, chunks: list[Chunk], 
     assert all(-1.0 <= r.score <= 1.0 for r in results)
 
 
-def test_hybrid_returns_results(
+def test_search_hybrid(
     chunks: list[Chunk], semantic: SelectableBasicBackend, bm25: bm25s.BM25, mock_model: Any
 ) -> None:
-    """Hybrid search returns results combining semantic and BM25 signals."""
+    """search_hybrid: returns combined results; identical content in different files produces separate results."""
     results = search_hybrid("authenticate token", mock_model, semantic, bm25, chunks, top_k=3)
     assert len(results) > 0
 
-
-def test_hybrid_keeps_both_locations_for_identical_content(mock_model: Any) -> None:
-    """Identical chunk content in different files produces two distinct results."""
     shared_content = "def helper():\n    pass"
     chunk_a = make_chunk(shared_content, "module_a.py")
     chunk_b = make_chunk(shared_content, "module_b.py")
@@ -91,8 +93,8 @@ def test_hybrid_keeps_both_locations_for_identical_content(mock_model: Any) -> N
     bm25_index = bm25s.BM25()
     bm25_index.index([tokenize(c.content) for c in all_chunks], show_progress=False)
 
-    results = search_hybrid("helper", mock_model, sem_index, bm25_index, all_chunks, top_k=5)
-    result_locations = {r.chunk.file_path for r in results}
+    deduped = search_hybrid("helper", mock_model, sem_index, bm25_index, all_chunks, top_k=5)
+    result_locations = {r.chunk.file_path for r in deduped}
     assert "module_a.py" in result_locations
     assert "module_b.py" in result_locations
 
@@ -122,7 +124,7 @@ def test_search_source_labels(
 
 
 def test_sort_top_k() -> None:
-    """Test that the sort top k is a faster version of argsort."""
+    """_sort_top_k returns the same indices as np.argsort(-x)[:top_k]."""
     gen = np.random.default_rng()
     x = gen.standard_normal(size=(10000,))
     top_k = 100
@@ -130,14 +132,32 @@ def test_sort_top_k() -> None:
     assert np.all(indices == np.argsort(-x)[:top_k])
 
 
-def test_bm25_with_selector_high_indices(bm25: bm25s.BM25, chunks: list[Chunk]) -> None:
-    """BM25 with a selector whose indices exceed len(selector) does not crash."""
-    selector = np.array([len(chunks) - 1], dtype=np.int_)
-    results = search_bm25("format", bm25, chunks, top_k=4, selector=selector)
-    assert all(r.chunk is chunks[len(chunks) - 1] for r in results)
+@pytest.mark.parametrize(
+    ("model_path", "expected_call_arg"),
+    [
+        (None, "minishlab/potion-code-16M"),  # default model
+        ("some/custom/model", "some/custom/model"),  # explicit path forwarded
+    ],
+)
+def test_load_model(model_path: str | None, expected_call_arg: str) -> None:
+    """load_model calls from_pretrained with default or custom model path."""
+    fake_model = MagicMock(spec=Encoder)
+    with patch("semble.index.dense.StaticModel.from_pretrained", return_value=fake_model) as mock_fp:
+        result = load_model(model_path)
+    mock_fp.assert_called_once_with(expected_call_arg)
+    assert result is fake_model
 
 
-@pytest.mark.parametrize("query", ["", "   ", "\n\n"])
-def test_bm25_empty_query_returns_empty(bm25: bm25s.BM25, chunks: list[Chunk], query: str) -> None:
-    """Empty / whitespace-only queries return [] instead of crashing bm25s."""
-    assert search_bm25(query, bm25, chunks, top_k=3, selector=None) == []
+def test_embed_chunks_empty_returns_empty_array(mock_model: Any) -> None:
+    """embed_chunks with an empty list returns a (0, 256) float32 array."""
+    result = embed_chunks(mock_model, [])
+    assert result.shape == (0, 256)
+    assert result.dtype == np.float32
+
+
+def test_selectable_basic_backend_rejects_k_below_one(
+    semantic: SelectableBasicBackend, embeddings: npt.NDArray[np.float32]
+) -> None:
+    """SelectableBasicBackend.query guards against k < 1."""
+    with pytest.raises(ValueError, match="k should be >= 1"):
+        semantic.query(embeddings[:1], k=0)

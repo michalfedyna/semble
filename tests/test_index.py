@@ -2,6 +2,7 @@ import os
 import subprocess
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -59,31 +60,12 @@ def test_search_invalid_mode(indexed_index: SembleIndex) -> None:
         indexed_index.search("query", mode="invalid")
 
 
-def test_search_top_k_respected(indexed_index: SembleIndex) -> None:
-    """Results never exceed the requested top_k."""
-    results = indexed_index.search("function", top_k=1, mode="bm25")
-    assert len(results) <= 1
+def test_search_constraints(indexed_index: SembleIndex) -> None:
+    """search: top_k is respected; no duplicate chunks are returned."""
+    assert len(indexed_index.search("function", top_k=1, mode="bm25")) <= 1
 
-
-def test_search_no_duplicate_chunks(indexed_index: SembleIndex) -> None:
-    """Each result chunk appears at most once in the result list."""
     results = indexed_index.search("authenticate", top_k=5)
     assert len(results) == len(set(r.chunk for r in results))
-
-
-def test_find_related_returns_similar_chunks(indexed_index: SembleIndex) -> None:
-    """find_related returns semantically similar chunks for a known file location."""
-    chunk = indexed_index.chunks[0]
-    results = indexed_index.find_related(chunk.file_path, chunk.start_line, top_k=3)
-    assert isinstance(results, list)
-    assert all(r.chunk != chunk for r in results)
-    assert len(results) <= 3
-
-
-def test_find_related_unknown_file_returns_empty(indexed_index: SembleIndex) -> None:
-    """find_related returns an empty list when the file is not in the index."""
-    results = indexed_index.find_related("/does/not/exist.py", 1)
-    assert results == []
 
 
 @pytest.mark.parametrize("mode", ["bm25", "hybrid", "semantic"])
@@ -99,6 +81,17 @@ def test_search_with_filter_paths_does_not_crash(indexed_index: SembleIndex, mod
 def test_search_empty_query_returns_empty(indexed_index: SembleIndex, mode: str, query: str) -> None:
     """Empty / whitespace-only queries return [] across all modes."""
     assert indexed_index.search(query, mode=mode) == []
+
+
+def test_find_related(indexed_index: SembleIndex) -> None:
+    """find_related: returns similar chunks for a known location; returns [] for an unknown file."""
+    chunk = indexed_index.chunks[0]
+    results = indexed_index.find_related(chunk.file_path, chunk.start_line, top_k=3)
+    assert isinstance(results, list)
+    assert all(r.chunk != chunk for r in results)
+    assert len(results) <= 3
+
+    assert indexed_index.find_related("/does/not/exist.py", 1) == []
 
 
 _GIT_ENV = {
@@ -130,19 +123,13 @@ def git_repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_from_git_indexes_local_repo(mock_model: Any, git_repo: Path) -> None:
-    """from_git clones a local repo and returns a populated SembleIndex."""
+def test_from_git_indexes_local_repo_with_relative_paths(mock_model: Any, git_repo: Path) -> None:
+    """from_git clones a local repo, indexes it, and keeps chunk paths repo-relative."""
     idx = SembleIndex.from_git(str(git_repo), model=mock_model)
     assert idx.stats.indexed_files >= 1
     assert idx.stats.total_chunks > 0
     assert any("main.py" in c.file_path for c in idx.chunks)
-
-
-def test_from_git_paths_are_repo_relative(mock_model: Any, git_repo: Path) -> None:
-    """Chunk file_paths are repo-relative after cloning, not absolute temp-dir paths."""
-    idx = SembleIndex.from_git(str(git_repo), model=mock_model)
-    for chunk in idx.chunks:
-        assert not Path(chunk.file_path).is_absolute(), f"Expected relative path, got: {chunk.file_path}"
+    assert all(not Path(c.file_path).is_absolute() for c in idx.chunks)
 
 
 def test_from_git_with_branch(mock_model: Any, tmp_path: Path) -> None:
@@ -159,7 +146,28 @@ def test_from_git_with_branch(mock_model: Any, tmp_path: Path) -> None:
     assert "feature.py" in file_names
 
 
-def test_from_git_invalid_url_raises(mock_model: Any) -> None:
-    """from_git raises RuntimeError when the clone fails."""
+@pytest.mark.parametrize(
+    ("kind", "expected_exc"),
+    [("missing", FileNotFoundError), ("file", NotADirectoryError)],
+)
+def test_from_path_rejects_invalid_paths(
+    mock_model: Any, tmp_path: Path, kind: str, expected_exc: type[Exception]
+) -> None:
+    """from_path raises FileNotFoundError for missing paths and NotADirectoryError for files."""
+    if kind == "missing":
+        target = tmp_path / "does_not_exist"
+    else:
+        target = tmp_path / "not_a_dir.py"
+        target.write_text("x = 1\n")
+    with pytest.raises(expected_exc):
+        SembleIndex.from_path(target, model=mock_model)
+
+
+def test_from_git_raises_on_failure(mock_model: Any) -> None:
+    """from_git raises RuntimeError when the clone fails or git is not installed."""
     with pytest.raises(RuntimeError, match="git clone failed"):
         SembleIndex.from_git("/nonexistent/path/that/does/not/exist", model=mock_model)
+
+    with patch("semble.index.index.subprocess.run", side_effect=FileNotFoundError):
+        with pytest.raises(RuntimeError, match="git is not installed"):
+            SembleIndex.from_git("https://github.com/x/y", model=mock_model)
