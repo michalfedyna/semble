@@ -18,7 +18,8 @@ Semble is a fast code search library for local and remote repositories. It combi
 ## Quickstart
 
 ```bash
-pip install semble
+pip install semble  # Install with pip
+uv add semble       # Install with uv
 ```
 
 ```python
@@ -38,6 +39,9 @@ result.chunk.file_path   # "model2vec/model.py"
 result.chunk.start_line  # 127
 result.chunk.end_line    # 150
 result.chunk.content     # "def save_pretrained(self, path: PathLike, ..."
+
+# Find code similar to a specific location in the codebase
+related = index.find_related("model2vec/model.py", line=127, top_k=3)
 ```
 
 ## Main Features
@@ -80,6 +84,19 @@ Add to `~/.opencode/config.json`:
 }
 ```
 
+#### Cursor
+Add to `~/.cursor/mcp.json` (or `.cursor/mcp.json` in your project):
+```json
+{
+  "mcpServers": {
+    "semble": {
+      "command": "uvx",
+      "args": ["--from", "semble[mcp]", "semble"]
+    }
+  }
+}
+```
+
 ### Tools
 
 | Tool | Description |
@@ -89,7 +106,9 @@ Add to `~/.opencode/config.json`:
 
 ## Benchmarks
 
-Quality and speed across all methods on ~1,250 queries over 63 repositories in 19 languages.
+Quality and speed across all methods on ~1,250 queries over 63 repositories in 19 languages. X-axis is total latency (index + first query); y-axis is NDCG@10. Marker size reflects model parameter count.
+
+![Speed vs quality](assets/images/speed_vs_ndcg_cold.png)
 
 | Method | NDCG@10 | Index time | Query p50 |
 |--------|--------:|-----------:|----------:|
