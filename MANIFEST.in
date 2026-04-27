@@ -1,3 +1,4 @@
 recursive-exclude benchmarks *
 recursive-exclude assets *
 recursive-exclude src *.egg-info
+exclude uv.lock
