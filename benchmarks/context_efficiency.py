@@ -2,7 +2,6 @@ import argparse
 import asyncio
 import json
 import random
-import re
 import subprocess
 import sys
 import time
@@ -24,6 +23,7 @@ from benchmarks.data import (
     add_filter_args,
     grouped_tasks,
     load_filtered_tasks,
+    results_path,
     save_results,
     target_matches_location,
 )
@@ -43,9 +43,6 @@ _TOKENIZER_NAME = "cl100k_base"
 _RG_CONTEXTS = (8,)
 _RG_MAX_MATCHES = 500
 _SEMBLE_TOP_K = 50
-_KEYWORD_MAX_FILES = 20
-_KEYWORD_MODEL = "gpt-5-mini"
-_KEYWORD_CONCURRENCY = 16
 _JUDGE_MODEL = "gpt-5-mini"
 _JUDGE_CONCURRENCY = 8
 _JUDGE_RETRIES = 3
@@ -55,23 +52,6 @@ _JUDGE_GREP_BUDGET = 16000
 
 _IMAGES_DIR = Path(__file__).parent.parent / "assets" / "images"
 _RESULTS_DIR = Path(__file__).parent / "results"
-
-_KEYWORD_PROMPT = """\
-Extract 1–3 grep-friendly search terms from the code search query below.
-Terms will be joined with | and used as a ripgrep regex pattern (not fixed strings).
-Prefer specific identifiers, class names, or technical keywords over generic words.
-Return only the pipe-separated terms — no explanation, no quotes, no punctuation.
-
-Examples:
-  flat_hash_map  →  flat_hash_map
-  absl::flat_hash_map and flat_hash_set containers  →  flat_hash_map|flat_hash_set
-  how does authentication middleware work  →  middleware|authentication
-  request lifecycle and error handling  →  lifecycle|error_handling
-  how are worker threads managed  →  worker_thread|thread_pool|ThreadPool
-
-Query: {query}
-Terms:\
-"""
 
 _JUDGE_PROMPT = """\
 You are evaluating whether retrieved code context is sufficient to answer a code search query.
@@ -113,23 +93,20 @@ def _semble_units(index: SembleIndex, query: str) -> list[Chunk]:
     return [r.chunk for r in index.search(query, top_k=_SEMBLE_TOP_K)]
 
 
-def _rg_command(pattern: str, repo_dir: Path, *, fixed_strings: bool) -> list[str]:
+def _rg_command(pattern: str, repo_dir: Path) -> list[str]:
     """Build the rg command line, scoped to the same code-file universe semble indexes."""
-    cmd = ["rg", "--json"]
-    if fixed_strings:
-        cmd.append("--fixed-strings")
-    cmd.append("--ignore-case")
+    cmd = ["rg", "--json", "--fixed-strings", "--ignore-case"]
     for glob in (*_RG_EXCLUDE_GLOBS, *_RG_INCLUDE_GLOBS):
         cmd += ["--glob", glob]
     cmd += [pattern, str(repo_dir)]
     return cmd
 
 
-def _rg_matches(pattern: str, repo_dir: Path, *, fixed_strings: bool) -> list[tuple[str, int]]:
+def _rg_matches(pattern: str, repo_dir: Path) -> list[tuple[str, int]]:
     """Return (file_path, line_number) matches via rg --json, in rg's output order."""
     try:
         proc = subprocess.run(
-            _rg_command(pattern, repo_dir, fixed_strings=fixed_strings),
+            _rg_command(pattern, repo_dir),
             capture_output=True,
             text=True,
             timeout=30,
@@ -158,7 +135,7 @@ def _rg_matches(pattern: str, repo_dir: Path, *, fixed_strings: bool) -> list[tu
 
 def _ripgrep_units(query: str, repo_dir: Path, context: int) -> list[Chunk]:
     """Ripgrep windows: files ranked by match count desc, windows merged within file."""
-    matches = _rg_matches(query, repo_dir, fixed_strings=True)
+    matches = _rg_matches(query, repo_dir)
     if not matches:
         return []
     per_file: dict[str, list[int]] = defaultdict(list)
@@ -188,17 +165,12 @@ def _ripgrep_units(query: str, repo_dir: Path, context: int) -> list[Chunk]:
 def _grep_file_units(
     pattern: str,
     repo_dir: Path,
-    *,
-    fixed_strings: bool,
-    max_files: int | None = None,
 ) -> list[Chunk]:
     """Return whole matched files in match-count order."""
-    matches = _rg_matches(pattern, repo_dir, fixed_strings=fixed_strings)
+    matches = _rg_matches(pattern, repo_dir)
     if not matches:
         return []
     ranked = sorted(Counter(path for path, _ in matches[:_RG_MAX_MATCHES]).items(), key=lambda kv: (-kv[1], kv[0]))
-    if max_files is not None:
-        ranked = ranked[:max_files]
     units: list[Chunk] = []
     for path, _ in ranked:
         try:
@@ -209,78 +181,21 @@ def _grep_file_units(
     return units
 
 
-def _keyword_method(cap: int) -> str:
-    """Return the method label for a keyword-grep file cap."""
-    return "keyword-grep+read" if cap == _KEYWORD_MAX_FILES else f"keyword-grep+read-top{cap}"
-
-
 def _retrieval_units_for_task(
     index: SembleIndex,
     task: Task,
     repo_dir: Path,
     *,
-    keywords: dict[str, str] | None,
-    keyword_caps: tuple[int, ...] = (_KEYWORD_MAX_FILES,),
     include_ripgrep: bool = False,
 ) -> list[tuple[str, list[Chunk]]]:
     """Return retrieval-method units for a task in benchmark order."""
     methods = [
         ("semble", _semble_units(index, task.query)),
-        ("grep+read", _grep_file_units(task.query, repo_dir, fixed_strings=True)),
+        ("grep+read", _grep_file_units(task.query, repo_dir)),
     ]
-    if keywords is not None:
-        pattern = keywords.get(task.query, task.query)
-        methods.extend(
-            (_keyword_method(cap), _grep_file_units(pattern, repo_dir, fixed_strings=False, max_files=cap))
-            for cap in keyword_caps
-        )
     if include_ripgrep:
         methods.extend((f"ripgrep-c{c}", _ripgrep_units(task.query, repo_dir, c)) for c in _RG_CONTEXTS)
     return methods
-
-
-_KEYWORD_TOKEN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_:.\-]{0,63}$")
-
-
-def _sanitize_keywords(pattern: str) -> str | None:
-    """Accept a pipe-joined regex pattern only if every segment is an identifier-like token."""
-    parts = [p.strip() for p in pattern.split("|") if p.strip()]
-    if not parts or len(parts) > 5:
-        return None
-    if not all(_KEYWORD_TOKEN_RE.match(p) for p in parts):
-        return None
-    return "|".join(parts)
-
-
-async def _extract_keyword_pattern(query: str, client: AsyncOpenAI) -> str:
-    """Ask the LLM for 1–3 pipe-separated grep terms; sanitize, fall back to re.escape(query) on failure."""
-    fallback = re.escape(query)
-    try:
-        resp = await client.responses.create(
-            model=_KEYWORD_MODEL,
-            input=_KEYWORD_PROMPT.format(query=query),
-            reasoning={"effort": "minimal"},
-        )
-        raw = (resp.output_text or "").strip().strip('"').strip("'")
-        sanitized = _sanitize_keywords(raw)
-        return sanitized if sanitized is not None else fallback
-    except Exception:  # noqa: BLE001
-        return fallback
-
-
-async def _prefetch_keywords(queries: list[str]) -> dict[str, str]:
-    """Return {query: regex_pattern} for all unique queries via LLM keyword extraction."""
-    unique = list(dict.fromkeys(queries))
-    client = AsyncOpenAI()
-    sem = asyncio.Semaphore(_KEYWORD_CONCURRENCY)
-    results: dict[str, str] = {}
-
-    async def worker(q: str) -> None:
-        async with sem:
-            results[q] = await _extract_keyword_pattern(q, client)
-
-    await asyncio.gather(*(worker(q) for q in unique))
-    return results
 
 
 def _curve(units: list[Chunk], targets: tuple[Target, ...], enc: Any) -> Curve:
@@ -454,7 +369,6 @@ def _evaluate_repo_recall(
     tasks: list[Task],
     repo_dir: Path,
     enc: Any,
-    keywords: dict[str, str] | None,
 ) -> dict[str, MethodCurves]:
     """Build per-method curves for every task in the repo."""
     methods: dict[str, MethodCurves] = defaultdict(list)
@@ -466,7 +380,6 @@ def _evaluate_repo_recall(
             index,
             task,
             repo_dir,
-            keywords=keywords,
             include_ripgrep=True,
         ):
             methods[method].append((_curve(units, targets, enc), n))
@@ -478,8 +391,6 @@ def _build_pending_judge(
     repo_specs: dict[str, Any],
     model: StaticModel,
     enc: Any,
-    keywords: dict[str, str],
-    keyword_caps: tuple[int, ...],
 ) -> list[tuple[Task, str, str, int]]:
     """Build (task, method, context, tokens) inputs for the LLM judge across all sampled tasks."""
     pending: list[tuple[Task, str, str, int]] = []
@@ -494,8 +405,6 @@ def _build_pending_judge(
                 index,
                 task,
                 spec.benchmark_dir,
-                keywords=keywords,
-                keyword_caps=keyword_caps,
             ):
                 budget = _JUDGE_SEMBLE_BUDGET if method == "semble" else _JUDGE_GREP_BUDGET
                 context, tokens = _format_context(units, budget, enc)
@@ -527,16 +436,30 @@ def _aggregate_judge(records: list[JudgeRecord], attempted_per_method: dict[str,
     return out
 
 
+def _save_judge_records(records: list[JudgeRecord]) -> Path:
+    """Write per-query judge records as compact JSONL for version comparisons."""
+    out = results_path("context-efficiency-judge-records").with_suffix(".jsonl")
+    lines = [
+        json.dumps(
+            {
+                "repo": r.repo,
+                "query": r.query,
+                "category": r.category,
+                "method": r.method,
+                "tokens": r.tokens_used,
+                "answered": r.answered,
+            },
+            separators=(",", ":"),
+        )
+        for r in records
+    ]
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out
+
+
 _PLOT_STYLE: dict[str, dict[str, object]] = {
     "semble": {"label": "semble", "color": "#1a5fa8", "linewidth": 2.4, "zorder": 4},
-    "keyword-grep+read": {
-        "label": "keyword grep + read file",
-        "color": "#d35400",
-        "linewidth": 1.8,
-        "zorder": 3,
-        "linestyle": "--",
-    },
-    "grep+read": {"label": "naive grep + read file", "color": "#922b21", "linewidth": 1.8, "zorder": 3},
+    "grep+read": {"label": "grep + read file", "color": "#922b21", "linewidth": 1.8, "zorder": 3},
     "ripgrep-c8": {
         "label": "ripgrep -C 8 (snippets)",
         "color": "#707070",
@@ -640,15 +563,6 @@ def run_recall(args: argparse.Namespace) -> None:
     enc = tiktoken.get_encoding(_TOKENIZER_NAME)
     model = StaticModel.from_pretrained(_DEFAULT_MODEL_NAME)
 
-    keywords: dict[str, str] | None = None
-    if not args.no_keyword:
-        try:
-            print("Pre-fetching keyword patterns (requires OPENAI_API_KEY)...", file=sys.stderr)
-            keywords = asyncio.run(_prefetch_keywords([t.query for t in tasks]))
-            print(f"  done ({len(keywords)} unique queries)", file=sys.stderr)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  keyword pre-fetch failed ({exc}); skipping keyword-grep+read", file=sys.stderr)
-
     method_curves: dict[str, MethodCurves] = defaultdict(list)
     print(f"\n{'Repo':<22} {'Language':<12} {'Tasks':>6} {'Time':>8}", file=sys.stderr)
     print(f"{'-' * 22} {'-' * 12} {'-' * 6} {'-' * 8}", file=sys.stderr)
@@ -656,7 +570,7 @@ def run_recall(args: argparse.Namespace) -> None:
         spec = repo_specs[repo]
         started = time.perf_counter()
         index = SembleIndex.from_path(spec.benchmark_dir, model=model)
-        per_method = _evaluate_repo_recall(index, repo_task_list, spec.benchmark_dir, enc, keywords)
+        per_method = _evaluate_repo_recall(index, repo_task_list, spec.benchmark_dir, enc)
         for m, lst in per_method.items():
             method_curves[m].extend(lst)
         print(
@@ -700,11 +614,7 @@ def run_judge(args: argparse.Namespace) -> None:
     enc = tiktoken.get_encoding(_TOKENIZER_NAME)
     model = StaticModel.from_pretrained(_DEFAULT_MODEL_NAME)
 
-    print("Pre-fetching keyword patterns...", file=sys.stderr)
-    keywords = asyncio.run(_prefetch_keywords([t.query for t in sample]))
-    print(f"  done ({len(keywords)} unique queries)", file=sys.stderr)
-
-    pending = _build_pending_judge(sample, repo_specs, model, enc, keywords, tuple(args.keyword_caps))
+    pending = _build_pending_judge(sample, repo_specs, model, enc)
     attempted_per_method: dict[str, int] = defaultdict(int)
     for _, method, _, _ in pending:
         attempted_per_method[method] += 1
@@ -743,11 +653,9 @@ def run_judge(args: argparse.Namespace) -> None:
     for method, c in e_costs.items():
         print(f"  {method:<24} {c:>9.0f}", file=sys.stderr)
 
-    if "semble" in e_costs:
-        for method in ("grep+read", "keyword-grep+read"):
-            if method in e_costs and e_costs[method] > 0:
-                reduction = 1.0 - e_costs["semble"] / e_costs[method]
-                print(f"Reduction (semble vs {method}, end-to-end): {reduction:.1%}", file=sys.stderr)
+    if "semble" in e_costs and e_costs.get("grep+read", 0) > 0:
+        reduction = 1.0 - e_costs["semble"] / e_costs["grep+read"]
+        print(f"Reduction (semble vs grep+read, end-to-end): {reduction:.1%}", file=sys.stderr)
 
     payload = {
         "tool": "context-efficiency-judge",
@@ -757,24 +665,15 @@ def run_judge(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "budgets": {"semble": _JUDGE_SEMBLE_BUDGET, "grep+read": _JUDGE_GREP_BUDGET},
         "fallback_tokens": fallback,
-        "keyword_patterns": keywords,
         "summary": summary,
         "raw_retrieval_reduction_vs_semble": {m: round(v, 4) for m, v in raw_reductions.items() if m != "semble"},
         "expected_cost": e_costs,
-        "records": [
-            {
-                "repo": r.repo,
-                "query": r.query,
-                "category": r.category,
-                "method": r.method,
-                "tokens": r.tokens_used,
-                "answered": r.answered,
-            }
-            for r in records
-        ],
     }
+    records_out = _save_judge_records(records)
+    payload["records_file"] = records_out.name
     out = save_results("context-efficiency-judge", payload)
     print(f"\nResults saved to {out}", file=sys.stderr)
+    print(f"Records saved to {records_out}", file=sys.stderr)
 
 
 def run_plot(args: argparse.Namespace) -> None:
@@ -791,12 +690,11 @@ def run_plot(args: argparse.Namespace) -> None:
 def _parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description="Context-efficiency benchmark: semble vs grep workflows.")
-    parser.set_defaults(func=run_recall, repo=[], language=[], no_keyword=False, no_plot=False)
+    parser.set_defaults(func=run_recall, repo=[], language=[], no_plot=False)
     sub = parser.add_subparsers(dest="mode", required=False)
 
     recall = sub.add_parser("recall", help="Recall vs. token-budget across all queries (default).")
     add_filter_args(recall)
-    recall.add_argument("--no-keyword", action="store_true", help="Skip the LLM keyword-extraction baseline.")
     recall.add_argument("--no-plot", action="store_true", help="Skip plotting after the run.")
     recall.set_defaults(func=run_recall)
 
@@ -809,13 +707,6 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=7474.0,
         help="Tokens an agent spends to fall back on a miss (pessimistic default).",
-    )
-    judge.add_argument(
-        "--keyword-caps",
-        type=int,
-        nargs="+",
-        default=[_KEYWORD_MAX_FILES],
-        help="Top-N file caps for keyword-grep+read sensitivity sweep.",
     )
     judge.set_defaults(func=run_judge)
 
