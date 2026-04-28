@@ -4,6 +4,7 @@ Quality and speed benchmarks for `semble`.
 
 - [Main results](#main-results)
 - [By language](#by-language)
+- [Context efficiency](#context-efficiency)
 - [Ablations](#ablations)
 - [Dataset](#dataset)
 - [Methods](#methods)
@@ -56,6 +57,74 @@ NDCG@10 per language, sorted by CodeRankEmbed Hybrid (CRE in the table). Best sc
 | haskell | 0.765 | 0.771 | **0.776** | 0.683 | 0.000 |
 | typescript | 0.706 | **0.708** | 0.545 | 0.430 | 0.128 |
 | **overall** | **0.854** | **0.862** | **0.765** | **0.693** | **0.126** |
+
+## Context efficiency
+
+Coding agents like Claude Code and OpenCode rely on `grep` to find candidate files and then `Read` those files into context. We model this workflow (`grep + read file`) and measure how many tokens each retrieval strategy spends to actually answer a query — judged end-to-end by an external LLM.
+
+> Across a 198-query category-balanced sample judged by GPT-5-mini, semble's retrieved context is sufficient to answer **88%** of queries at 2k tokens. A grep-based agent that first asks an LLM to extract grep-friendly keywords from the query (the strongest realistic baseline — closer to what Claude Code and OpenCode actually do) reaches **71%** but spends ~11k tokens reading candidate files. The raw retrieval-token saving is **81%** vs keyword grep and **50%** vs naive grep; including a pessimistic fallback model that adds the cost of redoing grep on a miss, end-to-end savings are **77%** and **69%** respectively.
+
+![Recall vs. retrieved tokens](../assets/images/recall_vs_tokens.png)
+
+### Answer sufficiency (LLM-as-judge)
+
+For each query we hand the retrieved context to GPT-5-mini and ask whether it contains enough relevant code to answer the query. Sample is 198 queries, balanced 66/66/66 across categories (note: the underlying benchmark is imbalanced 703/344/204 semantic/architecture/symbol; the macro-balanced sample is more conservative for semble's claim, since proportional sampling would weight the harder semantic category higher). Three retrieval workflows:
+
+- **semble** — top-K chunks, hard-capped at 2k tokens.
+- **keyword-grep+read** — gpt-5-mini extracts 1–3 grep-friendly terms from the query, joined as a regex (`term1|term2`); the agent reads the top-20 matched files in full, hard-capped at 16k tokens. Mirrors how Claude Code and OpenCode actually use grep.
+- **grep+read (naive)** — the raw query string is passed verbatim to `rg --fixed-strings`; matching files are read in full, hard-capped at 16k tokens. Strawman included for comparison.
+
+All three workflows search the same file universe — semble's indexed code-file extensions, with `node_modules`, `dist`, `build`, `.venv`, etc. excluded.
+
+| Method | Budget | Answer rate | Mean tokens retrieved | Raw token reduction vs semble | Expected end-to-end tokens† |
+|---|---:|---:|---:|---:|---:|
+| **semble** | 2k | **0.879** | 2,000 | — | **2,906** |
+| keyword-grep+read | 16k | 0.712 | 10,595 | 81.1% | 12,747 |
+| grep+read (naive) | 16k | 0.293 | 3,996 | 50.0% | 9,281 |
+
+**Raw retrieval reduction:** 81.1% vs keyword-grep, 50.0% vs naive grep.
+**End-to-end reduction (with fallback model):** 77.2% vs keyword-grep, 68.7% vs naive grep.
+
+†The end-to-end column adds a uniform fallback term `(1 − answer_rate) × 7,474` to every method, modeling the agent redoing a grep workflow on a miss. The constant 7,474 is the median tokens grep+read spends to surface a relevant file. Sweeping it 3k–16k gives an end-to-end reduction range of **61–74% vs naive grep** and **74–79% vs keyword grep** (recomputed from the saved artifact), so the conclusion is not load-bearing on this constant. The raw retrieval reduction is the model-free comparison.
+
+**Answer rate by query category:**
+
+| Category | semble | keyword-grep+read | naive grep |
+|---|---:|---:|---:|
+| symbol (named entity lookup) | 0.97 | 0.94 | 0.86 |
+| semantic (behavior / concept) | 0.85 | 0.52 | 0.02 |
+| architecture (design / structure) | 0.82 | 0.68 | 0.00 |
+
+Keyword extraction closes the gap on symbol queries, helps substantially on semantic and architecture — but at ~5× the retrieval token cost (full file reads, top-20 candidates), so the end-to-end gap remains large.
+
+### Recall at fixed token budgets
+
+A coarser, label-based view across the full 1,251-query benchmark: a relevant file is "covered" once any retrieved unit comes from it.
+
+| Method | 500 | 1k | 2k | 4k | 8k | 16k | 32k |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **semble** | **0.684** | **0.848** | **0.936** | **0.976** | **0.991** | **0.996** | **0.996** |
+| grep + read file | 0.000 | 0.007 | 0.023 | 0.042 | 0.076 | 0.101 | 0.127 |
+| ripgrep -C 8 | 0.069 | 0.091 | 0.107 | 0.117 | 0.131 | 0.143 | 0.150 |
+
+<details>
+<summary>Methodology</summary>
+
+**Retrieval units.** For each query we retrieve units in rank order — semble chunks for semble, full files (in match-count order) for `grep + read file`, merged context windows for `ripgrep -C N` — and accumulate tokens (`cl100k_base` via `tiktoken`). Naive `grep` is run with `--fixed-strings --ignore-case` on the raw query. The keyword variant first asks gpt-5-mini for 1–3 search terms (joined as a regex `|`); patterns that fail an identifier-token sanity check fall back to `re.escape(query)`. Both grep variants are scoped via `--glob` to the same code-file extensions and ignored directories that semble's file walker uses, so all three workflows search the same corpus.
+
+**Budget enforcement (judge mode only).** In the LLM-as-judge eval each context is hard-capped at its stated budget: the candidate string is encoded once, then sliced by token IDs and asserted `len(ids) ≤ budget`. The recall mode below does not truncate; its curves record cumulative tokens of whole retrieved units, which is the right shape for "tokens to surface the answer."
+
+**Sample policy.** The judge sample is **macro-balanced** — 66 queries per category — not proportional to the underlying 703/344/204 split. This is conservative for semble's claim: a proportional sample would overweight semantic queries (where grep does worst) and inflate the headline. The recall benchmark below uses all 1,251 queries with no rebalancing.
+
+**Sensitivity of the top-20 file cap.** Sweeping top-{5, 10, 20, 50} on the same sample (saved alongside the default cap in the same artifact), keyword-grep+read answer rates fall in 71.2–72.7% and the end-to-end reduction range is 76.3–77.2%. The cap is bounded by the 16k token budget, not the file count, so the choice is not load-bearing.
+
+**Sufficiency judging.** GPT-5-mini sees the query and the retrieved context (capped at the per-method budget) and answers a strict yes/no on whether the context contains code that directly addresses the query.
+
+**End-to-end cost model.** `expected_cost = retrieval_tokens + (1 − answer_rate) × fallback_tokens`. The fallback is set to 7,474 tokens — the median tokens grep+read spends to surface a relevant file, derived from the recall benchmark. This is *pessimistic* for semble: it assumes the agent rebuilds context from scratch on every miss, with no credit for chunks semble already returned.
+
+**Recall.** A relevant file is "covered" once any retrieved unit comes from it. Most labels are file-level; where line spans are present we require span overlap.
+
+</details>
 
 ## Ablations
 
@@ -187,6 +256,28 @@ Requires the `benchmark` extra (`uv sync --extra benchmark`).
 uv run python -m benchmarks.baselines.coderankembed
 uv run python -m benchmarks.baselines.coderankembed --mode semantic
 ```
+
+</details>
+
+<details>
+<summary>Context-efficiency benchmark</summary>
+
+Requires the `benchmark` extra (`uv sync --extra benchmark`), `rg` on `$PATH`, and an `OPENAI_API_KEY` environment variable (used for keyword extraction and the LLM-as-judge baseline; `--no-keyword` skips it for the recall mode).
+
+```bash
+# Recall vs. token-budget across all queries; plots automatically.
+uv run python -m benchmarks.context_efficiency recall
+uv run python -m benchmarks.context_efficiency recall --repo fastapi --no-keyword
+
+# LLM-as-judge sufficiency on a stratified sample.
+uv run python -m benchmarks.context_efficiency judge --sample 200
+uv run python -m benchmarks.context_efficiency judge --sample 200 --keyword-caps 5 10 20 50
+
+# Regenerate the plot from a saved recall payload.
+uv run python -m benchmarks.context_efficiency plot
+```
+
+Writes `benchmarks/results/context-efficiency-{recall,judge}-<sha12>.json` and `assets/images/recall_vs_tokens.png`.
 
 </details>
 

@@ -1,7 +1,10 @@
+import argparse
 import json
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 BENCH_ROOT = Path.home() / ".cache" / "semble-bench"
 BENCHMARKS_DIR = Path(__file__).parent
@@ -140,6 +143,38 @@ def apply_task_filters(
     return [task for task in filtered if not languages or task.language in languages]
 
 
+def add_filter_args(parser: argparse.ArgumentParser, *, verbose: bool = False) -> None:
+    """Add shared benchmark repo/language filter arguments."""
+    parser.add_argument("--repo", action="append", default=[], help="Limit to one or more repo names.")
+    parser.add_argument("--language", action="append", default=[], help="Limit to one or more languages.")
+    if verbose:
+        parser.add_argument("--verbose", action="store_true", help="Print per-query results.")
+
+
+def load_filtered_tasks(
+    repos: list[str] | None = None, languages: list[str] | None = None
+) -> tuple[dict[str, RepoSpec], list[Task]]:
+    """Load available repo specs and matching tasks, exiting if the selection is empty."""
+    repo_specs = available_repo_specs()
+    tasks = apply_task_filters(load_tasks(repo_specs=repo_specs), repos=repos, languages=languages)
+    if not tasks:
+        raise SystemExit("No benchmark tasks matched the requested filters.")
+    return repo_specs, tasks
+
+
+def summarize_modes(results: Sequence[Any], modes: Sequence[str]) -> dict[str, dict[str, float]]:
+    """Return average NDCG@10 and p50 latency for each mode."""
+    summary: dict[str, dict[str, float]] = {}
+    for mode in modes:
+        mode_results = [r for r in results if r.mode == mode]
+        n = len(mode_results)
+        summary[mode] = {
+            "avg_ndcg10": round(sum(r.ndcg10 for r in mode_results) / n, 4) if n else 0.0,
+            "avg_p50_ms": round(sum(r.p50_ms for r in mode_results) / n, 1) if n else 0.0,
+        }
+    return summary
+
+
 def path_matches(file_path: str, target_path: str) -> bool:
     """Return True if either path is a suffix of the other (handles absolute vs relative paths)."""
     norm_file = file_path.replace("\\", "/")
@@ -173,11 +208,7 @@ def current_sha() -> str:
 
 
 def results_path(method: str) -> Path:
-    """Return the path where results for this method and the current HEAD SHA will be saved.
-
-    :param method: Short tool/method label (e.g. 'ripgrep', 'colgrep').
-    :return: Path of the form benchmarks/results/<method>-<sha12>.json.
-    """
+    """Return benchmarks/results/<method>-<sha12>.json for the current HEAD."""
     sha = current_sha()
     results_dir = BENCHMARKS_DIR / "results"
     results_dir.mkdir(exist_ok=True)
@@ -185,12 +216,7 @@ def results_path(method: str) -> Path:
 
 
 def save_results(method: str, payload: object) -> Path:
-    """Write payload to benchmarks/results/<method>-<sha12>.json and return the path.
-
-    :param method: Short tool/method label used as the filename prefix (e.g. 'ripgrep').
-    :param payload: JSON-serialisable object to write.
-    :return: Path to the written file.
-    """
+    """Write JSON results and return the output path."""
     out_path = results_path(method)
     out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return out_path

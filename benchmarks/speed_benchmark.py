@@ -1,16 +1,15 @@
-import json
 import subprocess
 import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 from model2vec import StaticModel
 from sentence_transformers import SentenceTransformer
 
 from benchmarks.data import RepoSpec, Task, available_repo_specs, load_tasks, save_results
+from benchmarks.tools import run_colgrep_files, run_ripgrep_count
 from semble import SembleIndex
 from semble.index.dense import _DEFAULT_MODEL_NAME
 from semble.types import EmbeddingMatrix, Encoder
@@ -40,7 +39,6 @@ _REPOS: list[str] = [
 
 _TOP_K = 10
 _COLGREP = "colgrep"
-_RG = "rg"
 
 
 @dataclass(frozen=True)
@@ -88,58 +86,6 @@ class _CREWrapper:
         if len(text_list) == 1:
             return self._model.encode(text_list, prompt_name="query", batch_size=1)  # type: ignore[return-value]
         return self._model.encode(text_list, batch_size=1)  # type: ignore[return-value]
-
-
-def _run_ripgrep(query: str, benchmark_dir: Path) -> list[str]:
-    """Run ripgrep and return top-k file paths sorted by match count."""
-    cmd = [
-        _RG,
-        "--count",
-        "--no-heading",
-        "--ignore-case",
-        "--hidden",
-        "--glob",
-        "!.git",
-        "--fixed-strings",
-        query,
-        str(benchmark_dir),
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        return []
-    if proc.returncode not in (0, 1):
-        return []
-    entries: list[tuple[str, int]] = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        *path_parts, count_str = line.split(":")
-        try:
-            entries.append((":".join(path_parts), int(count_str)))
-        except ValueError:
-            continue
-    entries.sort(key=lambda x: -x[1])
-    return [path for path, _ in entries[:_TOP_K]]
-
-
-def _run_colgrep(query: str, benchmark_dir: Path, *, code_only: bool = True) -> list[str]:
-    """Run ColGREP and return top-k file paths from the JSON output."""
-    cmd = [_COLGREP, "--force-cpu", "--json", "-k", str(_TOP_K), query, str(benchmark_dir)]
-    if code_only:
-        cmd.append("--code-only")
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    except subprocess.TimeoutExpired:
-        return []
-    if proc.returncode != 0:
-        return []
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return []
-    return [item["unit"]["file"] for item in data if "unit" in item and "file" in item["unit"]]
 
 
 def _bench_semble(
@@ -194,13 +140,13 @@ def _bench_colgrep(spec: RepoSpec, tasks: list[Task]) -> tuple[float, tuple[floa
     if proc.returncode != 0:
         print(f"  WARNING: colgrep init failed: {proc.stderr.strip()}", file=sys.stderr)
     if "(0 files)" in proc.stdout or "(0 files)" in proc.stderr:
-        print(f"  SKIP: colgrep indexed 0 files (unsupported language?)", file=sys.stderr)
+        print("  SKIP: colgrep indexed 0 files (unsupported language?)", file=sys.stderr)
         return None
     latencies: list[float] = []
     code_only = spec.language != "bash"
     for task in tasks:
         started = time.perf_counter()
-        _run_colgrep(task.query, spec.benchmark_dir, code_only=code_only)
+        run_colgrep_files(task.query, spec.benchmark_dir, top_k=_TOP_K, code_only=code_only, timeout=60)
         latencies.append((time.perf_counter() - started) * 1000)
     return index_ms, tuple(latencies)
 
@@ -211,7 +157,7 @@ def _bench_ripgrep(spec: RepoSpec, tasks: list[Task]) -> tuple[float, tuple[floa
     for task in tasks:
         for _ in range(3):
             started = time.perf_counter()
-            _run_ripgrep(task.query, spec.benchmark_dir)
+            run_ripgrep_count(task.query, spec.benchmark_dir, top_k=_TOP_K)
             latencies.append((time.perf_counter() - started) * 1000)
     return 0.0, tuple(latencies)
 

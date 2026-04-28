@@ -3,6 +3,7 @@ import json
 import sys
 import time
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -12,16 +13,16 @@ from sentence_transformers import SentenceTransformer
 from benchmarks.data import (
     RepoSpec,
     Task,
-    apply_task_filters,
-    available_repo_specs,
+    add_filter_args,
     grouped_tasks,
-    load_tasks,
+    load_filtered_tasks,
     results_path,
     save_results,
+    summarize_modes,
 )
 from benchmarks.metrics import ndcg_at_k, target_rank
 from semble import SembleIndex
-from semble.types import SearchResult
+from semble.types import EmbeddingMatrix, SearchResult
 
 _MODEL_NAME = "nomic-ai/CodeRankEmbed"
 _TOP_K = 10
@@ -29,21 +30,18 @@ _LATENCY_RUNS = 3  # transformer inference is slow; keep runs low
 
 
 class _AsymmetricWrapper:
-    """Wrap SentenceTransformer with asymmetric query/document prompts.
-
-    Single-element lists are treated as queries; larger batches as documents.
-    max_seq_length is capped to avoid OOM on CPU with long chunks.
-    """
+    """Wrap SentenceTransformer with asymmetric query/document prompts."""
 
     def __init__(self, model: SentenceTransformer, max_seq_length: int = 512) -> None:
         self._model = model
         self._model.max_seq_length = max_seq_length
 
-    def encode(self, texts: list[str]) -> np.ndarray:
+    def encode(self, texts: Sequence[str], /) -> EmbeddingMatrix:
         """Encode texts with query or document prompt based on batch size."""
-        if len(texts) == 1:
-            return self._model.encode(texts, prompt_name="query", batch_size=1)  # type: ignore[return-value]
-        return self._model.encode(texts, batch_size=1)  # type: ignore[return-value]
+        text_list = list(texts)
+        if len(text_list) == 1:
+            return self._model.encode(text_list, prompt_name="query", batch_size=1)  # type: ignore[return-value]
+        return self._model.encode(text_list, batch_size=1)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -115,21 +113,7 @@ def _build_summary(results: list[RepoResult], modes: list[str]) -> dict[str, obj
     return {
         "tool": "coderankembed",
         "model": _MODEL_NAME,
-        "by_mode": {
-            mode: {
-                "avg_ndcg10": round(
-                    sum(result.ndcg10 for result in results if result.mode == mode)
-                    / max(1, sum(1 for result in results if result.mode == mode)),
-                    4,
-                ),
-                "avg_p50_ms": round(
-                    sum(result.p50_ms for result in results if result.mode == mode)
-                    / max(1, sum(1 for result in results if result.mode == mode)),
-                    1,
-                ),
-            }
-            for mode in modes
-        },
+        "by_mode": summarize_modes(results, modes),
         "repos": [asdict(result) for result in results],
     }
 
@@ -227,12 +211,10 @@ def _bench(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark CodeRankEmbed on the semble benchmark suite.")
-    parser.add_argument("--repo", action="append", default=[], help="Limit to one or more repo names.")
-    parser.add_argument("--language", action="append", default=[], help="Limit to one or more languages.")
+    add_filter_args(parser, verbose=True)
     parser.add_argument(
         "--mode", action="append", default=[], choices=["semantic", "hybrid"], help="Search mode(s) (default: both)."
     )
-    parser.add_argument("--verbose", action="store_true", help="Print per-query results.")
     return parser.parse_args()
 
 
@@ -242,12 +224,7 @@ def main() -> None:
     modes = args.mode or ["semantic", "hybrid"]
     is_full_run = not args.repo and not args.language
 
-    repo_specs = available_repo_specs()
-    tasks = apply_task_filters(
-        load_tasks(repo_specs=repo_specs), repos=args.repo or None, languages=args.language or None
-    )
-    if not tasks:
-        raise SystemExit("No benchmark tasks matched the requested filters.")
+    repo_specs, tasks = load_filtered_tasks(args.repo or None, args.language or None)
 
     print(f"Loading {_MODEL_NAME}...", file=sys.stderr)
     started = time.perf_counter()

@@ -1,5 +1,4 @@
 import argparse
-import json
 import sys
 import time
 from collections import defaultdict
@@ -11,10 +10,9 @@ from model2vec import StaticModel
 from benchmarks.data import (
     RepoSpec,
     Task,
-    apply_task_filters,
-    available_repo_specs,
+    add_filter_args,
     grouped_tasks,
-    load_tasks,
+    load_filtered_tasks,
     save_results,
 )
 from benchmarks.metrics import ndcg_at_k, target_rank
@@ -274,16 +272,9 @@ def _save_results(results: list[RepoResult]) -> None:
 def main() -> None:
     """Parse arguments and run the semble hybrid benchmark."""
     parser = argparse.ArgumentParser(description="Benchmark hybrid semble search across the pinned benchmark repos.")
-    parser.add_argument("--repo", action="append", default=[], help="Limit to one or more repo names.")
-    parser.add_argument("--language", action="append", default=[], help="Limit to one or more languages.")
-    parser.add_argument("--verbose", action="store_true", help="Print per-query results.")
+    add_filter_args(parser, verbose=True)
     args = parser.parse_args()
-    repo_specs = available_repo_specs()
-    tasks = apply_task_filters(
-        load_tasks(repo_specs=repo_specs), repos=args.repo or None, languages=args.language or None
-    )
-    if not tasks:
-        raise SystemExit("No benchmark tasks matched the requested filters.")
+    repo_specs, tasks = load_filtered_tasks(args.repo or None, args.language or None)
     print("Loading model...", file=sys.stderr)
     started = time.perf_counter()
     model = StaticModel.from_pretrained(_DEFAULT_MODEL_NAME)

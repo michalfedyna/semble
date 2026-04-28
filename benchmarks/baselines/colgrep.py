@@ -9,14 +9,14 @@ from pathlib import Path
 from benchmarks.data import (
     RepoSpec,
     Task,
-    apply_task_filters,
-    available_repo_specs,
+    add_filter_args,
     grouped_tasks,
-    load_tasks,
+    load_filtered_tasks,
     results_path,
     save_results,
 )
 from benchmarks.metrics import file_rank, ndcg_at_k
+from benchmarks.tools import run_colgrep_files
 
 _COLGREP = "colgrep"
 _TOP_K = 10
@@ -34,25 +34,6 @@ class RepoResult:
     index_ms: float
 
 
-def _run_colgrep(query: str, benchmark_dir: Path, top_k: int, *, code_only: bool = True) -> list[str]:
-    """Return list of absolute file paths from colgrep JSON output."""
-    cmd = [_COLGREP, "--force-cpu"]
-    if code_only:
-        cmd.append("--code-only")
-    cmd += ["--json", "-k", str(top_k), query, str(benchmark_dir)]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        return []
-    if proc.returncode != 0:
-        return []
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return []
-    return [item["unit"]["file"] for item in data if "unit" in item and "file" in item["unit"]]
-
-
 def _evaluate_repo(
     tasks: list[Task], benchmark_dir: Path, *, code_only: bool = True, verbose: bool = False
 ) -> tuple[float, float]:
@@ -65,7 +46,7 @@ def _evaluate_repo(
         file_paths: list[str] = []
         for _ in range(_LATENCY_RUNS):
             started = time.perf_counter()
-            file_paths = _run_colgrep(task.query, benchmark_dir, _TOP_K, code_only=code_only)
+            file_paths = run_colgrep_files(task.query, benchmark_dir, top_k=_TOP_K, code_only=code_only)
             query_latencies.append((time.perf_counter() - started) * 1000)
         latencies.append(sorted(query_latencies)[_LATENCY_RUNS // 2])
 
@@ -88,11 +69,7 @@ def _evaluate_repo(
 
 
 def _init_index(path: Path) -> tuple[bool, float]:
-    """Build (or rebuild) the colgrep index at path; return (non_empty, elapsed_ms).
-
-    :param path: Directory to index.
-    :return: Tuple of (non_empty, index_ms) where non_empty is False if colgrep reported 0 files.
-    """
+    """Build the ColGREP index and return whether it indexed files plus elapsed time."""
     subprocess.run([_COLGREP, "clear", str(path)], capture_output=True, timeout=30)
     cmd = [_COLGREP, "init", "--force-cpu", "-y", str(path)]
     started = time.perf_counter()
@@ -106,14 +83,7 @@ def _init_index(path: Path) -> tuple[bool, float]:
 
 
 def _resolve_path(spec: RepoSpec) -> tuple[Path, float]:
-    """Return the path ColGREP should index and elapsed index build time.
-
-    Tries benchmark_dir first; if that yields 0 files falls back to checkout_dir,
-    which is the project root ColGREP needs to discover the .git boundary.
-
-    :param spec: Repo spec providing benchmark_dir and checkout_dir.
-    :return: Tuple of (effective_path, index_ms).
-    """
+    """Return the path ColGREP should index and elapsed index build time."""
     path = spec.benchmark_dir
     ok, index_ms = _init_index(path)
     if ok:
@@ -174,9 +144,7 @@ def _load_completed(out_path: Path) -> dict[str, RepoResult]:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark ColGREP on the semble benchmark suite.")
-    parser.add_argument("--repo", action="append", default=[], help="Limit to one or more repo names.")
-    parser.add_argument("--language", action="append", default=[], help="Limit to one or more languages.")
-    parser.add_argument("--verbose", action="store_true", help="Print per-query results.")
+    add_filter_args(parser, verbose=True)
     parser.add_argument(
         "--no-code-only",
         action="store_true",
@@ -229,12 +197,7 @@ def main() -> None:
     args = _parse_args()
     is_full_run = not args.repo and not args.language
 
-    repo_specs = available_repo_specs()
-    tasks = apply_task_filters(
-        load_tasks(repo_specs=repo_specs), repos=args.repo or None, languages=args.language or None
-    )
-    if not tasks:
-        raise SystemExit("No benchmark tasks matched the requested filters.")
+    repo_specs, tasks = load_filtered_tasks(args.repo or None, args.language or None)
 
     repo_tasks = grouped_tasks(tasks)
 

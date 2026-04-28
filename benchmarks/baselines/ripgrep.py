@@ -1,6 +1,5 @@
 import argparse
 import json
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -8,15 +7,14 @@ from pathlib import Path
 
 from benchmarks.data import (
     Task,
-    apply_task_filters,
-    available_repo_specs,
+    add_filter_args,
     grouped_tasks,
-    load_tasks,
+    load_filtered_tasks,
     save_results,
 )
 from benchmarks.metrics import file_rank, ndcg_at_k
+from benchmarks.tools import run_ripgrep_count
 
-_RG = "rg"
 _TOP_K = 10
 _LATENCY_RUNS = 3
 
@@ -29,36 +27,6 @@ class RepoResult:
     language: str
     ndcg10: float
     p50_ms: float
-
-
-def _run_ripgrep(query: str, benchmark_dir: Path, *, fixed_strings: bool = True) -> list[str]:
-    """Return file paths sorted by match count descending (rg --count output)."""
-    cmd = [_RG, "--count", "--no-heading", "--ignore-case", "--hidden", "--glob", "!.git"]
-    if fixed_strings:
-        cmd.append("--fixed-strings")
-    cmd += [query, str(benchmark_dir)]
-
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        return []
-    if proc.returncode not in (0, 1):
-        return []
-
-    entries: list[tuple[str, int]] = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        *path_parts, count_str = line.split(":")
-        try:
-            count = int(count_str)
-        except ValueError:
-            continue
-        entries.append((":".join(path_parts), count))
-
-    entries.sort(key=lambda entry: -entry[1])
-    return [path for path, _ in entries[:_TOP_K]]
 
 
 def _evaluate_repo(
@@ -77,7 +45,7 @@ def _evaluate_repo(
         file_paths: list[str] = []
         for _ in range(_LATENCY_RUNS):
             started = time.perf_counter()
-            file_paths = _run_ripgrep(task.query, benchmark_dir, fixed_strings=fixed_strings)
+            file_paths = run_ripgrep_count(task.query, benchmark_dir, top_k=_TOP_K, fixed_strings=fixed_strings)
             query_latencies.append((time.perf_counter() - started) * 1000)
         latencies.append(sorted(query_latencies)[_LATENCY_RUNS // 2])
 
@@ -99,9 +67,7 @@ def _evaluate_repo(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark ripgrep on the semble benchmark suite.")
-    parser.add_argument("--repo", action="append", default=[], help="Limit to one or more repo names.")
-    parser.add_argument("--language", action="append", default=[], help="Limit to one or more languages.")
-    parser.add_argument("--verbose", action="store_true", help="Print per-query results.")
+    add_filter_args(parser, verbose=True)
     parser.add_argument(
         "--no-fixed-strings",
         dest="fixed_strings",
@@ -116,12 +82,7 @@ def main() -> None:
     """Run the ripgrep baseline benchmark."""
     args = _parse_args()
 
-    repo_specs = available_repo_specs()
-    tasks = apply_task_filters(
-        load_tasks(repo_specs=repo_specs), repos=args.repo or None, languages=args.language or None
-    )
-    if not tasks:
-        raise SystemExit("No benchmark tasks matched the requested filters.")
+    repo_specs, tasks = load_filtered_tasks(args.repo or None, args.language or None)
 
     mode_label = "fixed-strings" if args.fixed_strings else "regex"
     print(f"ripgrep ({mode_label})", file=sys.stderr)

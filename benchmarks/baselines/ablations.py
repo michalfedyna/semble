@@ -11,11 +11,11 @@ from model2vec import StaticModel
 from benchmarks.data import (
     RepoSpec,
     Task,
-    apply_task_filters,
-    available_repo_specs,
+    add_filter_args,
     grouped_tasks,
-    load_tasks,
+    load_filtered_tasks,
     save_results,
+    summarize_modes,
 )
 from benchmarks.metrics import ndcg_at_k, target_rank
 from semble import SembleIndex
@@ -163,12 +163,10 @@ def _bench(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="semble ablation benchmarks.")
-    parser.add_argument("--repo", action="append", default=[], help="Limit to one or more repo names.")
-    parser.add_argument("--language", action="append", default=[], help="Limit to one or more languages.")
+    add_filter_args(parser, verbose=True)
     parser.add_argument(
         "--mode", action="append", default=[], choices=_MODES, help="Mode(s) to evaluate (default: all)."
     )
-    parser.add_argument("--verbose", action="store_true", help="Print per-query results.")
     return parser.parse_args()
 
 
@@ -177,12 +175,7 @@ def main() -> None:
     args = _parse_args()
     modes = args.mode or _MODES
 
-    repo_specs = available_repo_specs()
-    tasks = apply_task_filters(
-        load_tasks(repo_specs=repo_specs), repos=args.repo or None, languages=args.language or None
-    )
-    if not tasks:
-        raise SystemExit("No benchmark tasks matched the requested filters.")
+    repo_specs, tasks = load_filtered_tasks(args.repo or None, args.language or None)
 
     print("Loading model...", file=sys.stderr)
     started = time.perf_counter()
@@ -210,21 +203,7 @@ def main() -> None:
     summary = {
         "tool": "semble-ablations",
         "model": _DEFAULT_MODEL_NAME,
-        "by_mode": {
-            mode: {
-                "avg_ndcg10": round(
-                    sum(r.ndcg10 for r in results if r.mode == mode)
-                    / max(1, sum(1 for r in results if r.mode == mode)),
-                    4,
-                ),
-                "avg_p50_ms": round(
-                    sum(r.p50_ms for r in results if r.mode == mode)
-                    / max(1, sum(1 for r in results if r.mode == mode)),
-                    1,
-                ),
-            }
-            for mode in modes
-        },
+        "by_mode": summarize_modes(results, modes),
         "repos": [asdict(r) for r in results],
     }
     print(json.dumps(summary, indent=2))
