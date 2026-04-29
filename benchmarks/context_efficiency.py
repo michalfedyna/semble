@@ -18,6 +18,7 @@ from model2vec import StaticModel
 from openai import AsyncOpenAI
 
 from benchmarks.data import (
+    RepoSpec,
     Target,
     Task,
     add_filter_args,
@@ -47,8 +48,8 @@ _JUDGE_MODEL = "gpt-5-mini"
 _JUDGE_CONCURRENCY = 8
 _JUDGE_RETRIES = 3
 _JUDGE_DEFAULT_SAMPLE = 200
-_JUDGE_SEMBLE_BUDGET = 2000
-_JUDGE_GREP_BUDGET = 16000
+_JUDGE_TOP_KS = (3, 5, 10, 20)
+_JUDGE_CONTEXT_CAP = 32_000
 
 _IMAGES_DIR = Path(__file__).parent.parent / "assets" / "images"
 _RESULTS_DIR = Path(__file__).parent / "results"
@@ -195,6 +196,18 @@ def _retrieval_units_for_task(
     ]
     if include_ripgrep:
         methods.extend((f"ripgrep-c{c}", _ripgrep_units(task.query, repo_dir, c)) for c in _RG_CONTEXTS)
+    return methods
+
+
+def _retrieval_units_for_judge(
+    index: SembleIndex,
+    task: Task,
+    repo_dir: Path,
+) -> list[tuple[str, list[Chunk]]]:
+    """Return (method, units) for the judge: semble sliced at each top_k, plus grep+read."""
+    all_semble = _semble_units(index, task.query)
+    methods: list[tuple[str, list[Chunk]]] = [(f"semble-top{k}", all_semble[:k]) for k in _JUDGE_TOP_KS]
+    methods.append(("grep+read", _grep_file_units(task.query, repo_dir)))
     return methods
 
 
@@ -388,7 +401,7 @@ def _evaluate_repo_recall(
 
 def _build_pending_judge(
     tasks: list[Task],
-    repo_specs: dict[str, Any],
+    repo_specs: dict[str, RepoSpec],
     model: StaticModel,
     enc: Any,
 ) -> list[tuple[Task, str, str, int]]:
@@ -401,13 +414,8 @@ def _build_pending_judge(
         started = time.perf_counter()
         index = SembleIndex.from_path(spec.benchmark_dir, model=model)
         for task in task_list:
-            for method, units in _retrieval_units_for_task(
-                index,
-                task,
-                spec.benchmark_dir,
-            ):
-                budget = _JUDGE_SEMBLE_BUDGET if method == "semble" else _JUDGE_GREP_BUDGET
-                context, tokens = _format_context(units, budget, enc)
+            for method, units in _retrieval_units_for_judge(index, task, spec.benchmark_dir):
+                context, tokens = _format_context(units, _JUDGE_CONTEXT_CAP, enc)
                 pending.append((task, method, context, tokens))
         print(f"{repo:<22} {len(task_list):>6} {time.perf_counter() - started:>7.1f}s", file=sys.stderr)
     return pending
@@ -629,33 +637,13 @@ def run_judge(args: argparse.Namespace) -> None:
         print(f"  WARNING: {n_missing} verdicts missing — see n_failed per method.", file=sys.stderr)
 
     summary = _aggregate_judge(records, dict(attempted_per_method))
-    print(f"\n{'Method':<24} {'n':>5} {'answer_rate':>12} {'mean_tokens':>12}", file=sys.stderr)
-    print(f"{'-' * 24} {'-' * 5} {'-' * 12} {'-' * 12}", file=sys.stderr)
+    print(f"\n{'Method':<24} {'mean_tokens':>12} {'answer_rate':>12}", file=sys.stderr)
+    print(f"{'-' * 24} {'-' * 12} {'-' * 12}", file=sys.stderr)
     for method, info in summary.items():
         print(
-            f"{method:<24} {info['n']:>5} {info['answer_rate']:>12.3f} {info['mean_tokens_retrieved']:>12.0f}",
+            f"{method:<24} {info['mean_tokens_retrieved']:>12.0f} {info['answer_rate']:>12.3f}",
             file=sys.stderr,
         )
-
-    semble_retrieval = summary.get("semble", {}).get("mean_tokens_retrieved", 0.0)
-    print("\nRaw retrieval tokens (no fallback model):", file=sys.stderr)
-    raw_reductions: dict[str, float] = {}
-    for method, info in summary.items():
-        other = info["mean_tokens_retrieved"]
-        red = 1.0 - semble_retrieval / other if method != "semble" and other > 0 else 0.0
-        raw_reductions[method] = red
-        suffix = f"  reduction vs semble: {red:.1%}" if method != "semble" else ""
-        print(f"  {method:<24} {other:>9.0f}{suffix}", file=sys.stderr)
-
-    fallback = args.fallback_tokens
-    e_costs = {m: s["mean_tokens_retrieved"] + ((1.0 - s["answer_rate"]) * fallback) for m, s in summary.items()}
-    print(f"\nExpected end-to-end tokens (pessimistic fallback = {fallback:.0f} tokens):", file=sys.stderr)
-    for method, c in e_costs.items():
-        print(f"  {method:<24} {c:>9.0f}", file=sys.stderr)
-
-    if "semble" in e_costs and e_costs.get("grep+read", 0) > 0:
-        reduction = 1.0 - e_costs["semble"] / e_costs["grep+read"]
-        print(f"Reduction (semble vs grep+read, end-to-end): {reduction:.1%}", file=sys.stderr)
 
     payload = {
         "tool": "context-efficiency-judge",
@@ -663,11 +651,9 @@ def run_judge(args: argparse.Namespace) -> None:
         "tokenizer": _TOKENIZER_NAME,
         "sample_size": len(sample),
         "seed": args.seed,
-        "budgets": {"semble": _JUDGE_SEMBLE_BUDGET, "grep+read": _JUDGE_GREP_BUDGET},
-        "fallback_tokens": fallback,
+        "top_ks": list(_JUDGE_TOP_KS),
+        "context_cap": _JUDGE_CONTEXT_CAP,
         "summary": summary,
-        "raw_retrieval_reduction_vs_semble": {m: round(v, 4) for m, v in raw_reductions.items() if m != "semble"},
-        "expected_cost": e_costs,
     }
     records_out = _save_judge_records(records)
     payload["records_file"] = records_out.name
@@ -702,12 +688,6 @@ def _parse_args() -> argparse.Namespace:
     judge.add_argument("--sample", type=int, default=_JUDGE_DEFAULT_SAMPLE, help="Number of stratified queries.")
     judge.add_argument("--seed", type=int, default=42, help="Random seed for sampling.")
     judge.add_argument("--concurrency", type=int, default=_JUDGE_CONCURRENCY, help="Concurrent judge calls.")
-    judge.add_argument(
-        "--fallback-tokens",
-        type=float,
-        default=7474.0,
-        help="Tokens an agent spends to fall back on a miss (pessimistic default).",
-    )
     judge.set_defaults(func=run_judge)
 
     plot = sub.add_parser("plot", help="Regenerate the recall-vs-tokens plot from a saved JSON.")
