@@ -221,7 +221,6 @@ def _plot_recall_vs_tokens(payload: dict[str, Any], out_path: Path) -> None:
     plot_data = payload["plot"]
     budgets = plot_data["budgets"]
     recalls = plot_data["recall"]
-    n_queries = payload.get("n_queries", "?")
 
     fig, ax = plt.subplots(figsize=(8, 5))
     fig.patch.set_facecolor("white")
@@ -253,7 +252,7 @@ def _plot_recall_vs_tokens(payload: dict[str, Any], out_path: Path) -> None:
     ax.set_xlabel("Retrieved context tokens", fontsize=10, color="#444444")
     ax.set_ylabel("Recall (relevant files surfaced)", fontsize=10, color="#444444")
     ax.set_title(
-        f"Context efficiency: recall vs. retrieved tokens  (n={n_queries} queries)",
+        "Token efficiency: recall vs. retrieved tokens",
         fontsize=12,
         color="#222222",
         pad=12,
@@ -348,7 +347,7 @@ def run_recall(args: argparse.Namespace) -> None:
     reductions = _print_first_hit_summary(method_curves)
 
     payload: dict[str, Any] = {
-        "tool": "context-efficiency-recall",
+        "tool": "token-efficiency",
         "tokenizer": _TOKENIZER_NAME,
         "budgets": list(_BUDGETS),
         "n_queries": len(method_curves["semble"]),
@@ -363,16 +362,16 @@ def run_recall(args: argparse.Namespace) -> None:
         print(json.dumps(payload, indent=2))
         return
 
-    out = save_results("context-efficiency-recall", payload)
+    out = save_results("token-efficiency", payload)
     print(f"\nResults saved to {out}", file=sys.stderr)
     if not args.no_plot:
         _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-        _plot_recall_vs_tokens(payload, _IMAGES_DIR / "recall_vs_tokens.png")
+        _plot_recall_vs_tokens(payload, _IMAGES_DIR / "token_efficiency.png")
 
 
 def run_plot(args: argparse.Namespace) -> None:
     """Plot recall-vs-tokens from a saved recall-mode payload."""
-    matches = sorted(_RESULTS_DIR.glob("context-efficiency-recall-*.json"))
+    matches = sorted(_RESULTS_DIR.glob("token-efficiency-*.json"))
     in_path = args.input or (matches[-1] if matches else None)
     if in_path is None:
         raise SystemExit(f"No recall results found in {_RESULTS_DIR}")
@@ -394,7 +393,7 @@ def _parse_args() -> argparse.Namespace:
 
     plot = sub.add_parser("plot", help="Regenerate the recall-vs-tokens plot from a saved JSON.")
     plot.add_argument("--input", type=Path, default=None, help="Path to recall results (default: newest).")
-    plot.add_argument("--output", type=Path, default=_IMAGES_DIR / "recall_vs_tokens.png", help="Output PNG path.")
+    plot.add_argument("--output", type=Path, default=_IMAGES_DIR / "token_efficiency.png", help="Output PNG path.")
     plot.set_defaults(func=run_plot)
 
     return parser.parse_args()

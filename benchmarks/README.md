@@ -62,7 +62,7 @@ NDCG@10 per language, sorted by CodeRankEmbed Hybrid (CRE in the table). Best sc
 
 Coding agents (Claude Code, OpenCode, etc.) typically find code by running `grep` on keywords and reading the matched files. We model that exact workflow and compare it against semble's chunk retrieval across 1,251 queries.
 
-![Recall vs. retrieved tokens](../assets/images/recall_vs_tokens.png)
+![Recall vs. retrieved tokens](../assets/images/token_efficiency.png)
 
 ### Recall at fixed token budgets
 
@@ -229,14 +229,14 @@ Requires the `benchmark` extra (`uv sync --extra benchmark`) and `rg` on `$PATH`
 
 ```bash
 # Recall vs. token-budget across all queries; plots automatically.
-uv run python -m benchmarks.context_efficiency recall
-uv run python -m benchmarks.context_efficiency recall --repo fastapi
+uv run python -m benchmarks.token_efficiency recall
+uv run python -m benchmarks.token_efficiency recall --repo fastapi
 
 # Regenerate the plot from a saved recall payload.
-uv run python -m benchmarks.context_efficiency plot
+uv run python -m benchmarks.token_efficiency plot
 ```
 
-Writes `benchmarks/results/context-efficiency-recall-<sha12>.json` and `assets/images/recall_vs_tokens.png`.
+Writes `benchmarks/results/token-efficiency-<sha12>.json` and `assets/images/token_efficiency.png`.
 
 </details>
 
