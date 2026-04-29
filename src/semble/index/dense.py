@@ -8,7 +8,8 @@ from vicinity.utils import normalize
 
 from semble.types import Chunk, Encoder
 
-_DEFAULT_MODEL_NAME = "minishlab/potion-code-16M"
+DEFAULT_MODEL_NAME = "minishlab/potion-code-16M"
+_DEFAULT_MODEL_NAME = DEFAULT_MODEL_NAME
 
 
 def load_model(model_path: str | None = None) -> Encoder:

@@ -4,10 +4,12 @@ import subprocess
 import tempfile
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 from bm25s import BM25
+from vicinity.backends.basic import BasicArgs
 
 from semble.index.create import create_index_from_path
 from semble.index.dense import SelectableBasicBackend, load_model
@@ -63,6 +65,20 @@ class SembleIndex:
             total_chunks=len(self.chunks),
             languages=dict(language_counts),
         )
+
+    def to_artifact(self) -> dict[str, Any]:
+        """Return a pickleable representation of the index without the model."""
+        return {
+            "chunks": self.chunks,
+            "bm25_index": self._bm25_index,
+            "semantic_vectors": self._semantic_index.vectors,
+        }
+
+    @classmethod
+    def from_artifact(cls, artifact: dict[str, Any], model: Encoder) -> SembleIndex:
+        """Reconstruct an index from a persisted artifact and loaded model."""
+        semantic_index = SelectableBasicBackend(artifact["semantic_vectors"], BasicArgs())
+        return cls(model, artifact["bm25_index"], semantic_index, artifact["chunks"])
 
     @classmethod
     def from_path(

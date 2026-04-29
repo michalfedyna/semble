@@ -17,13 +17,14 @@
 
 [Quickstart](#quickstart) •
 [Main Features](#main-features) •
-[MCP Server](#mcp-server) •
+[CLI](#cli) •
+[OpenCode Tools](#opencode-tools) •
 [How it works](#how-it-works) •
 [Benchmarks](#benchmarks)
 
 </div>
 
-Semble is a code search library built for agents. It returns the exact code snippets they need instantly, cutting both token usage and waiting time on every step. Indexing and searching a full codebase end-to-end takes under a second, with ~200x faster indexing and ~10x faster queries than a code-specialized transformer, at 99% of its retrieval quality (see [benchmarks](#benchmarks)). Everything runs on CPU with no API keys, GPU, or external services. Run it as an [MCP server](#mcp-server) and any agent (Claude Code, Cursor, Codex, OpenCode, etc.) gets instant access to any repo, cloned and indexed on demand.
+Semble is a code search library built for agents. It returns the exact code snippets they need instantly, cutting both token usage and waiting time on every step. Indexing and searching a full codebase end-to-end takes under a second, with ~200x faster indexing and ~10x faster queries than a code-specialized transformer, at 99% of its retrieval quality (see [benchmarks](#benchmarks)). Everything runs on CPU with no API keys, GPU, or external services. Use it from Python, the `semble` CLI, or OpenCode custom tools backed by a local on-disk cache.
 
 ## Quickstart
 
@@ -60,62 +61,91 @@ result.chunk.content     # "def save_pretrained(self, path: PathLike, ..."
 - **Fast**: indexes a repo in ~250 ms and answers queries in ~1.5 ms, all on CPU.
 - **Accurate**: NDCG@10 of 0.854 on our [benchmarks](#benchmarks), on par with code-specialized transformer models, at a fraction of the size and cost.
 - **Local and remote**: pass a local path or a git URL.
-- **MCP server**: drop-in tool for Claude Code, Cursor, Codex, OpenCode, and any other MCP-compatible agent.
+- **Agent-ready CLI**: direct search and related-code commands with markdown snippets and persistent local cache.
 - **Zero setup**: runs on CPU with no API keys, GPU, or external services required.
 
-## MCP Server
+## CLI
 
-Semble can run as an MCP server so agents can search any codebase directly. Repos are cloned and indexed on demand, and indexes are cached for the lifetime of the session.
+Search a local path or git URL directly from the command line:
 
-### Setup
-
-> Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) to be installed.
-
-#### Claude Code
 ```bash
-claude mcp add semble -s user -- uvx --from "semble[mcp]" semble
+semble search "save model to disk" --path . --mode hybrid --top-k 5
+semble related --file src/semble/index/index.py --line 181 --path . --top-k 5
+semble related src/semble/index/index.py:181 --path . --top-k 5
 ```
 
-#### Codex
-Add to `~/.codex/config.toml`:
-```toml
-[mcp_servers.semble]
-command = "uvx"
-args = ["--from", "semble[mcp]", "semble"]
+Manage the on-disk cache:
+
+```bash
+semble cache stats --path .
+semble cache clear --path .
 ```
 
-#### OpenCode
-Add to `~/.opencode/config.json`:
-```json
-{
-  "mcp": {
-    "semble": {
-      "type": "local",
-      "command": ["uvx", "--from", "semble[mcp]", "semble"]
-    }
-  }
-}
+`--path` defaults to the current working directory. Results are returned as markdown snippets with file paths, line ranges, scores, and fenced code blocks.
+
+### Cache Behavior
+
+Indexes are cached under `~/.cache/semble` by default. Override this with:
+
+```bash
+SEMBLE_CACHE_DIR=/custom/cache/path semble search "query" --path .
 ```
 
-#### Cursor
-Add to `~/.cursor/mcp.json` (or `.cursor/mcp.json` in your project):
-```json
-{
-  "mcpServers": {
-    "semble": {
-      "command": "uvx",
-      "args": ["--from", "semble[mcp]", "semble"]
-    }
-  }
-}
+Each request checks whether the selected path is fresh before searching. For git worktrees, Semble fingerprints the worktree root using `HEAD`, `git status --porcelain`, and changed-file metadata. For non-git directories, it fingerprints included file paths, mtimes, and sizes. If the fingerprint changes, Semble rebuilds the index before returning results.
+
+Multiple OpenCode or CLI instances can use the same cache. Semble uses per-index lock directories and atomic writes so concurrent processes do not read or write partial index entries. A second process waits for or reuses the first completed cache entry.
+
+## OpenCode Tools
+
+Install the Semble OpenCode custom tools globally so they are available in every OpenCode project:
+
+- `~/.config/opencode/tools/code_search.ts` registers `code_search`.
+- `~/.config/opencode/tools/code_search_related.ts` registers `code_search_related`.
+
+The tools default to `context.worktree`, so the directory OpenCode was launched from is not the cache identity once the path is normalized. You can pass `path` explicitly to search another local path or git URL.
+
+This repository includes reusable templates under `examples/opencode/`. Copy them into your global OpenCode tools directory on machines where you want Semble tools installed:
+
+```bash
+mkdir -p ~/.config/opencode/tools
+cp examples/opencode/code_search.ts ~/.config/opencode/tools/code_search.ts
+cp examples/opencode/code_search_related.ts ~/.config/opencode/tools/code_search_related.ts
 ```
 
-### Tools
+If `semble` is not on `PATH`, set `SEMBLE_BIN` before launching OpenCode:
 
-| Tool | Description |
-|------|-------------|
-| `search` | Search a codebase with a natural-language or code query. Pass `repo` as a git URL or local path. |
-| `find_related` | Given a file path and line number, return chunks semantically similar to the code at that location. |
+```bash
+SEMBLE_BIN=/absolute/path/to/venv/bin/semble opencode
+```
+
+The wrapper executes `SEMBLE_BIN` as a single executable path. If you use `uv`, install Semble into an environment or create a small wrapper script rather than setting `SEMBLE_BIN` to a multi-word command.
+
+## Local Development
+
+Install this checkout in editable mode:
+
+```bash
+pip install -e /absolute/path/to/semble
+uv pip install -e /absolute/path/to/semble
+```
+
+If OpenCode is using a globally installed `semble` executable, refresh it after CLI entrypoint changes:
+
+```bash
+uv tool install --force .
+```
+
+Then run:
+
+```bash
+semble search "search" --path /absolute/path/to/semble --top-k 3
+```
+
+To use a local editable install from OpenCode, launch it with the installed executable:
+
+```bash
+SEMBLE_BIN=/absolute/path/to/venv/bin/semble opencode
+```
 
 ## How it works
 
