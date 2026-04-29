@@ -60,55 +60,32 @@ NDCG@10 per language, sorted by CodeRankEmbed Hybrid (CRE in the table). Best sc
 
 ## Context efficiency
 
-Coding agents often use `grep` to find candidate files and then read those files into context. We model that direct `grep + read file` workflow and compare it with semble's chunk retrieval.
+Coding agents (Claude Code, OpenCode, etc.) typically find code by running `grep` on keywords and reading the matched files. We model that exact workflow and compare it against semble's chunk retrieval across 1,251 queries.
 
 ![Recall vs. retrieved tokens](../assets/images/recall_vs_tokens.png)
 
-### Answer sufficiency (LLM-as-judge)
-
-For each query we hand the retrieved context to GPT-5-mini and ask whether it contains enough relevant code to answer the query. The sample is ~198 queries, balanced across semantic, architecture, and symbol categories.
-
-- **semble top-N** — the top-N ranked chunks returned by semble, formatted as-is (no artificial cap). Each variant models a different `top_k` setting in the MCP tool.
-- **grep+read** — the raw query string is passed to `rg --fixed-strings`; all matching files are read in full (capped at 32k tokens as a safety ceiling, rarely hit in practice).
-
-Both workflows search the same code-file universe: semble's indexed extensions, excluding `node_modules`, `dist`, `build`, `.venv`, and other ignored directories.
-
-| Method | Mean tokens | Answer rate |
-|---|---:|---:|
-| semble top-3 | — | — |
-| semble top-5 | — | — |
-| semble top-10 | — | — |
-| semble top-20 | — | — |
-| grep+read | — | — |
-
-> Run `uv run python -m benchmarks.context_efficiency judge` to populate this table.
-
-**Answer rate by query category:**
-
-| Category | semble top-5 | grep+read |
-|---|---:|---:|
-| symbol (named entity lookup) | — | — |
-| semantic (behavior / concept) | — | — |
-| architecture (design / structure) | — | — |
-
 ### Recall at fixed token budgets
 
-A coarser, label-based view across the full 1,251-query benchmark: a relevant file is "covered" once any retrieved unit comes from it.
+A relevant file is "covered" once any retrieved unit comes from it.
 
 | Method | 500 | 1k | 2k | 4k | 8k | 16k | 32k |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| **semble** | **0.684** | **0.848** | **0.936** | **0.976** | **0.991** | **0.996** | **0.996** |
-| grep + read file | 0.000 | 0.007 | 0.023 | 0.042 | 0.076 | 0.101 | 0.127 |
-| ripgrep -C 8 | 0.069 | 0.091 | 0.107 | 0.117 | 0.131 | 0.143 | 0.150 |
+| **semble** | **0.686** | **0.849** | **0.937** | **0.976** | **0.991** | **0.996** | **0.996** |
+| grep + read file | 0.000 | 0.007 | 0.023 | 0.042 | 0.076 | 0.100 | 0.125 |
+
+### Expected tokens per query
+
+For each query: tokens consumed at first relevant hit, or 32k if the method never finds anything. Averaged across all 1,251 queries.
+
+| Method | Expected tokens | vs semble |
+|---|---:|---:|
+| **semble** | **567** | — |
+| grep + read file | 29,675 | 52× more |
 
 <details>
 <summary>Methodology</summary>
 
-For each query we retrieve units in rank order — semble chunks for semble, full files in match-count order for `grep+read`, and merged context windows for `ripgrep -C 8` in the recall curve. Tokens are counted with `cl100k_base` via `tiktoken`. `grep` is run with `--fixed-strings --ignore-case` on the raw query and scoped via `--glob` to the same code-file extensions and ignored directories that semble indexes.
-
-Recall mode does not truncate; its curves record cumulative tokens of whole retrieved units. The judge sample is macro-balanced across categories; the recall benchmark uses all 1,251 queries.
-
-GPT-5-mini sees the query and retrieved context and answers a strict yes/no on whether the context contains code that directly addresses the query. A relevant file is "covered" in recall once any retrieved unit comes from it; where line spans are present we require span overlap.
+semble returns the top-50 ranked chunks. `grep+read` runs `rg --fixed-strings --ignore-case` on the raw query string, scoped to the same code-file extensions and ignored directories that semble indexes, then reads matched files in full in descending match-count order. Tokens counted with `cl100k_base` via `tiktoken`. Recall curves record cumulative tokens of whole retrieved units without truncation; a relevant file is "covered" once any retrieved unit overlaps its annotated span.
 
 </details>
 
@@ -248,21 +225,18 @@ uv run python -m benchmarks.baselines.coderankembed --mode semantic
 <details>
 <summary>Context-efficiency benchmark</summary>
 
-Requires the `benchmark` extra (`uv sync --extra benchmark`) and `rg` on `$PATH`. Judge mode also needs `OPENAI_API_KEY`.
+Requires the `benchmark` extra (`uv sync --extra benchmark`) and `rg` on `$PATH`.
 
 ```bash
 # Recall vs. token-budget across all queries; plots automatically.
 uv run python -m benchmarks.context_efficiency recall
 uv run python -m benchmarks.context_efficiency recall --repo fastapi
 
-# LLM-as-judge sufficiency on a stratified sample.
-uv run python -m benchmarks.context_efficiency judge --sample 200
-
 # Regenerate the plot from a saved recall payload.
 uv run python -m benchmarks.context_efficiency plot
 ```
 
-Writes `benchmarks/results/context-efficiency-{recall,judge}-<sha12>.json`, compact judge records as JSONL, and `assets/images/recall_vs_tokens.png`.
+Writes `benchmarks/results/context-efficiency-recall-<sha12>.json` and `assets/images/recall_vs_tokens.png`.
 
 </details>
 

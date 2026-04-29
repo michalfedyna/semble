@@ -1,12 +1,9 @@
 import argparse
-import asyncio
 import json
-import random
 import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeAlias
 
@@ -15,16 +12,13 @@ import matplotlib.ticker as ticker
 import numpy as np
 import tiktoken
 from model2vec import StaticModel
-from openai import AsyncOpenAI
 
 from benchmarks.data import (
-    RepoSpec,
     Target,
     Task,
     add_filter_args,
     grouped_tasks,
     load_filtered_tasks,
-    results_path,
     save_results,
     target_matches_location,
 )
@@ -39,54 +33,17 @@ _RG_INCLUDE_GLOBS: tuple[str, ...] = tuple(
 _RG_EXCLUDE_GLOBS: tuple[str, ...] = tuple(f"!{d}" for d in DEFAULT_IGNORED_DIRS)
 
 _BUDGETS = (500, 1000, 2000, 4000, 8000, 16000, 32000)
+_EXPECTED_COST_CAP = 32_000
 _PLOT_BUDGETS = sorted({int(b) for b in np.logspace(np.log10(100), np.log10(64000), 60)})
 _TOKENIZER_NAME = "cl100k_base"
-_RG_CONTEXTS = (8,)
 _RG_MAX_MATCHES = 500
 _SEMBLE_TOP_K = 50
-_JUDGE_MODEL = "gpt-5-mini"
-_JUDGE_CONCURRENCY = 8
-_JUDGE_RETRIES = 3
-_JUDGE_DEFAULT_SAMPLE = 200
-_JUDGE_TOP_KS = (3, 5, 10, 20)
-_JUDGE_CONTEXT_CAP = 32_000
 
 _IMAGES_DIR = Path(__file__).parent.parent / "assets" / "images"
 _RESULTS_DIR = Path(__file__).parent / "results"
 
-_JUDGE_PROMPT = """\
-You are evaluating whether retrieved code context is sufficient to answer a code search query.
-
-A code agent ran a search for the query below and got back the retrieved context shown. \
-Decide whether that context contains enough relevant code for an engineer to give a substantive \
-answer to the query (showing how something is implemented, where it lives, or how it works).
-
-Reply YES if the context contains code that directly addresses the query.
-Reply NO if the context is empty, off-topic, or only tangentially related.
-
-Reply with exactly one word: YES or NO.
-
-Query: {query}
-
-Retrieved context:
-{context}
-"""
-
-
 Curve: TypeAlias = list[tuple[int, int]]
 MethodCurves: TypeAlias = list[tuple[Curve, int]]
-
-
-@dataclass(frozen=True)
-class JudgeRecord:
-    """One LLM-judge sufficiency verdict."""
-
-    repo: str
-    query: str
-    category: str
-    method: str
-    tokens_used: int
-    answered: bool
 
 
 def _semble_units(index: SembleIndex, query: str) -> list[Chunk]:
@@ -134,35 +91,6 @@ def _rg_matches(pattern: str, repo_dir: Path) -> list[tuple[str, int]]:
     return matches
 
 
-def _ripgrep_units(query: str, repo_dir: Path, context: int) -> list[Chunk]:
-    """Ripgrep windows: files ranked by match count desc, windows merged within file."""
-    matches = _rg_matches(query, repo_dir)
-    if not matches:
-        return []
-    per_file: dict[str, list[int]] = defaultdict(list)
-    for path, ln in matches[:_RG_MAX_MATCHES]:
-        per_file[path].append(ln)
-    ranked = sorted(per_file.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-    units: list[Chunk] = []
-    for path, lines in ranked:
-        windows: list[list[int]] = []
-        for ln in sorted(set(lines)):
-            start, end = max(1, ln - context), ln + context
-            if windows and start <= windows[-1][1] + 1:
-                windows[-1][1] = max(windows[-1][1], end)
-            else:
-                windows.append([start, end])
-        try:
-            file_lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            continue
-        for start, end in windows:
-            end_clamped = min(end, len(file_lines))
-            text = "\n".join(file_lines[start - 1 : end_clamped])
-            units.append(Chunk(content=text, file_path=path, start_line=start, end_line=end_clamped))
-    return units
-
-
 def _grep_file_units(
     pattern: str,
     repo_dir: Path,
@@ -186,29 +114,12 @@ def _retrieval_units_for_task(
     index: SembleIndex,
     task: Task,
     repo_dir: Path,
-    *,
-    include_ripgrep: bool = False,
 ) -> list[tuple[str, list[Chunk]]]:
-    """Return retrieval-method units for a task in benchmark order."""
-    methods = [
+    """Return (method, units) pairs for a task."""
+    return [
         ("semble", _semble_units(index, task.query)),
         ("grep+read", _grep_file_units(task.query, repo_dir)),
     ]
-    if include_ripgrep:
-        methods.extend((f"ripgrep-c{c}", _ripgrep_units(task.query, repo_dir, c)) for c in _RG_CONTEXTS)
-    return methods
-
-
-def _retrieval_units_for_judge(
-    index: SembleIndex,
-    task: Task,
-    repo_dir: Path,
-) -> list[tuple[str, list[Chunk]]]:
-    """Return (method, units) for the judge: semble sliced at each top_k, plus grep+read."""
-    all_semble = _semble_units(index, task.query)
-    methods: list[tuple[str, list[Chunk]]] = [(f"semble-top{k}", all_semble[:k]) for k in _JUDGE_TOP_KS]
-    methods.append(("grep+read", _grep_file_units(task.query, repo_dir)))
-    return methods
 
 
 def _curve(units: list[Chunk], targets: tuple[Target, ...], enc: Any) -> Curve:
@@ -256,6 +167,12 @@ def _tokens_to_first_hit(curve: Curve) -> int | None:
     return None
 
 
+def _expected_cost_at_cap(curves: MethodCurves, cap: int) -> float:
+    """Mean tokens spent before first hit or giving up at cap, across all queries."""
+    costs = [hit if (hit := _tokens_to_first_hit(c)) is not None else cap for c, n in curves if n > 0]
+    return float(np.mean(costs)) if costs else float(cap)
+
+
 def _pairwise_reduction(semble: MethodCurves, other: MethodCurves) -> dict[str, float] | None:
     """Median 'tokens to first hit' reduction, paired on queries where both methods hit."""
     pairs: list[tuple[int, int]] = []
@@ -277,106 +194,6 @@ def _pairwise_reduction(semble: MethodCurves, other: MethodCurves) -> dict[str, 
     }
 
 
-def _format_context(units: list[Chunk], budget: int, enc: Any) -> tuple[str, int]:
-    """
-    Concatenate units with file headers, hard-capped at budget tokens.
-
-    Greedily appends blocks until the running estimate exceeds budget, then re-encodes the
-    joined string and slices by token IDs as the final guarantee.
-    """
-    if not units or budget <= 0:
-        return "(no context retrieved)", 0
-
-    parts: list[str] = []
-    rough_tokens = 0
-    for unit in units:
-        block = f"// {unit.location}\n{unit.content}"
-        parts.append(block)
-        rough_tokens += len(enc.encode(block, disallowed_special=())) + 2  # +2 for "\n\n"
-        if rough_tokens >= budget + 64:
-            break
-
-    context = "\n\n".join(parts)
-    ids = enc.encode(context, disallowed_special=())
-    if len(ids) > budget:
-        marker = "\n... [truncated]"
-        marker_ids = enc.encode(marker, disallowed_special=())
-        keep = max(0, budget - len(marker_ids))
-        context = enc.decode(ids[:keep]) + marker
-        ids = enc.encode(context, disallowed_special=())
-        if len(ids) > budget:
-            context = enc.decode(ids[:budget])
-            ids = enc.encode(context, disallowed_special=())
-    if len(ids) > budget:
-        raise AssertionError(f"context formatting exceeded budget: {len(ids)} > {budget}")
-    return context, len(ids)
-
-
-async def _judge_one(client: AsyncOpenAI, query: str, context: str) -> bool | None:
-    """Call the judge model; return True/False or None on parse failure or repeated errors."""
-    prompt = _JUDGE_PROMPT.format(query=query, context=context)
-    last_err: Exception | None = None
-    for attempt in range(_JUDGE_RETRIES):
-        try:
-            resp = await client.responses.create(
-                model=_JUDGE_MODEL,
-                input=prompt,
-                reasoning={"effort": "minimal"},
-            )
-            text = (resp.output_text or "").strip().upper()
-            if text.startswith("Y"):
-                return True
-            if text.startswith("N"):
-                return False
-            return None
-        except Exception as exc:  # noqa: BLE001
-            last_err = exc
-            await asyncio.sleep(1.5 * (attempt + 1))
-    print(f"  judge failed after {_JUDGE_RETRIES} retries: {last_err}", file=sys.stderr)
-    return None
-
-
-async def _judge_many(pending: list[tuple[Task, str, str, int]], concurrency: int) -> list[JudgeRecord]:
-    """Run judge calls with bounded concurrency."""
-    client = AsyncOpenAI()
-    sem = asyncio.Semaphore(concurrency)
-    results: list[JudgeRecord | None] = [None] * len(pending)
-
-    async def worker(i: int, task: Task, method: str, context: str, tokens: int) -> None:
-        async with sem:
-            verdict = await _judge_one(client, task.query, context)
-            if verdict is None:
-                return
-            results[i] = JudgeRecord(
-                repo=task.repo,
-                query=task.query,
-                category=task.category,
-                method=method,
-                tokens_used=tokens,
-                answered=verdict,
-            )
-
-    await asyncio.gather(*(worker(i, *p) for i, p in enumerate(pending)))
-    return [r for r in results if r is not None]
-
-
-def _stratified_sample(tasks: list[Task], n: int, seed: int) -> list[Task]:
-    """Sample n tasks stratified across categories."""
-    rng = random.Random(seed)
-    by_cat: dict[str, list[Task]] = defaultdict(list)
-    for task in tasks:
-        by_cat[task.category].append(task)
-    cats = sorted(by_cat)
-    per_cat = n // len(cats)
-    picked: list[Task] = []
-    for cat in cats:
-        bucket = by_cat[cat]
-        rng.shuffle(bucket)
-        picked.extend(bucket[:per_cat])
-    rng.shuffle(picked)
-    return picked
-
-
 def _evaluate_repo_recall(
     index: SembleIndex,
     tasks: list[Task],
@@ -385,96 +202,17 @@ def _evaluate_repo_recall(
 ) -> dict[str, MethodCurves]:
     """Build per-method curves for every task in the repo."""
     methods: dict[str, MethodCurves] = defaultdict(list)
-
     for task in tasks:
         targets = task.all_relevant
         n = len(targets)
-        for method, units in _retrieval_units_for_task(
-            index,
-            task,
-            repo_dir,
-            include_ripgrep=True,
-        ):
+        for method, units in _retrieval_units_for_task(index, task, repo_dir):
             methods[method].append((_curve(units, targets, enc), n))
     return dict(methods)
-
-
-def _build_pending_judge(
-    tasks: list[Task],
-    repo_specs: dict[str, RepoSpec],
-    model: StaticModel,
-    enc: Any,
-) -> list[tuple[Task, str, str, int]]:
-    """Build (task, method, context, tokens) inputs for the LLM judge across all sampled tasks."""
-    pending: list[tuple[Task, str, str, int]] = []
-    print(f"\n{'Repo':<22} {'Tasks':>6} {'Time':>8}", file=sys.stderr)
-    print(f"{'-' * 22} {'-' * 6} {'-' * 8}", file=sys.stderr)
-    for repo, task_list in sorted(grouped_tasks(tasks).items()):
-        spec = repo_specs[repo]
-        started = time.perf_counter()
-        index = SembleIndex.from_path(spec.benchmark_dir, model=model)
-        for task in task_list:
-            for method, units in _retrieval_units_for_judge(index, task, spec.benchmark_dir):
-                context, tokens = _format_context(units, _JUDGE_CONTEXT_CAP, enc)
-                pending.append((task, method, context, tokens))
-        print(f"{repo:<22} {len(task_list):>6} {time.perf_counter() - started:>7.1f}s", file=sys.stderr)
-    return pending
-
-
-def _aggregate_judge(records: list[JudgeRecord], attempted_per_method: dict[str, int]) -> dict[str, dict[str, Any]]:
-    """Group records by method and compute answer rate, mean tokens, missing-verdict count."""
-    by_method: dict[str, list[JudgeRecord]] = defaultdict(list)
-    for r in records:
-        by_method[r.method].append(r)
-    out: dict[str, dict[str, Any]] = {}
-    for method, attempted in attempted_per_method.items():
-        recs = by_method.get(method, [])
-        n_yes = sum(1 for r in recs if r.answered)
-        by_cat: dict[str, list[bool]] = defaultdict(list)
-        for r in recs:
-            by_cat[r.category].append(r.answered)
-        out[method] = {
-            "n": len(recs),
-            "n_attempted": attempted,
-            "n_failed": attempted - len(recs),
-            "answer_rate": n_yes / len(recs) if recs else 0.0,
-            "mean_tokens_retrieved": float(np.mean([r.tokens_used for r in recs])) if recs else 0.0,
-            "answer_rate_by_category": {c: sum(v) / len(v) for c, v in sorted(by_cat.items())},
-        }
-    return out
-
-
-def _save_judge_records(records: list[JudgeRecord]) -> Path:
-    """Write per-query judge records as compact JSONL for version comparisons."""
-    out = results_path("context-efficiency-judge-records").with_suffix(".jsonl")
-    lines = [
-        json.dumps(
-            {
-                "repo": r.repo,
-                "query": r.query,
-                "category": r.category,
-                "method": r.method,
-                "tokens": r.tokens_used,
-                "answered": r.answered,
-            },
-            separators=(",", ":"),
-        )
-        for r in records
-    ]
-    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return out
 
 
 _PLOT_STYLE: dict[str, dict[str, object]] = {
     "semble": {"label": "semble", "color": "#1a5fa8", "linewidth": 2.4, "zorder": 4},
     "grep+read": {"label": "grep + read file", "color": "#922b21", "linewidth": 1.8, "zorder": 3},
-    "ripgrep-c8": {
-        "label": "ripgrep -C 8 (snippets)",
-        "color": "#707070",
-        "linewidth": 1.4,
-        "zorder": 2,
-        "linestyle": "--",
-    },
 }
 
 
@@ -560,6 +298,26 @@ def _print_first_hit_summary(method_curves: dict[str, MethodCurves]) -> dict[str
             f"{red['median_reduction']:>10.1%}",
             file=sys.stderr,
         )
+
+    print(
+        f"\nExpected tokens per query (first hit or {_EXPECTED_COST_CAP // 1000}k cap if no hit)",
+        file=sys.stderr,
+    )
+    print(f"{'Method':<20} {'expected-tokens':>15}  {'vs-semble':>10}", file=sys.stderr)
+    print(f"{'-' * 20} {'-' * 15}  {'-' * 10}", file=sys.stderr)
+    semble_cost = _expected_cost_at_cap(method_curves["semble"], _EXPECTED_COST_CAP)
+    print(f"{'semble':<20} {semble_cost:>15.0f}", file=sys.stderr)
+    for method, curves in method_curves.items():
+        if method == "semble":
+            continue
+        cost = _expected_cost_at_cap(curves, _EXPECTED_COST_CAP)
+        ratio = cost / semble_cost if semble_cost > 0 else float("inf")
+        print(f"{method:<20} {cost:>15.0f}  {ratio:>9.1f}x", file=sys.stderr)
+        reductions[method]["expected_cost_at_cap"] = cost
+        reductions[method]["expected_cost_cap"] = float(_EXPECTED_COST_CAP)
+        reductions[method]["expected_cost_ratio_vs_semble"] = ratio
+    reductions["semble"] = {"expected_cost_at_cap": semble_cost, "expected_cost_cap": float(_EXPECTED_COST_CAP)}
+
     return reductions
 
 
@@ -612,56 +370,6 @@ def run_recall(args: argparse.Namespace) -> None:
         _plot_recall_vs_tokens(payload, _IMAGES_DIR / "recall_vs_tokens.png")
 
 
-def run_judge(args: argparse.Namespace) -> None:
-    """Run the LLM-as-judge sufficiency benchmark on a stratified sample."""
-    repo_specs, tasks = load_filtered_tasks()
-    sample = _stratified_sample(tasks, args.sample, args.seed)
-    print(f"Sampled {len(sample)} queries (seed={args.seed})", file=sys.stderr)
-
-    print("Loading model + tokenizer...", file=sys.stderr)
-    enc = tiktoken.get_encoding(_TOKENIZER_NAME)
-    model = StaticModel.from_pretrained(_DEFAULT_MODEL_NAME)
-
-    pending = _build_pending_judge(sample, repo_specs, model, enc)
-    attempted_per_method: dict[str, int] = defaultdict(int)
-    for _, method, _, _ in pending:
-        attempted_per_method[method] += 1
-
-    print(f"\nJudging {len(pending)} (query, method) pairs with {_JUDGE_MODEL}...", file=sys.stderr)
-    started = time.perf_counter()
-    records = asyncio.run(_judge_many(pending, args.concurrency))
-    elapsed = time.perf_counter() - started
-    print(f"  done in {elapsed:.1f}s ({len(records)}/{len(pending)} returned a verdict)", file=sys.stderr)
-    n_missing = len(pending) - len(records)
-    if n_missing:
-        print(f"  WARNING: {n_missing} verdicts missing — see n_failed per method.", file=sys.stderr)
-
-    summary = _aggregate_judge(records, dict(attempted_per_method))
-    print(f"\n{'Method':<24} {'mean_tokens':>12} {'answer_rate':>12}", file=sys.stderr)
-    print(f"{'-' * 24} {'-' * 12} {'-' * 12}", file=sys.stderr)
-    for method, info in summary.items():
-        print(
-            f"{method:<24} {info['mean_tokens_retrieved']:>12.0f} {info['answer_rate']:>12.3f}",
-            file=sys.stderr,
-        )
-
-    payload = {
-        "tool": "context-efficiency-judge",
-        "judge_model": _JUDGE_MODEL,
-        "tokenizer": _TOKENIZER_NAME,
-        "sample_size": len(sample),
-        "seed": args.seed,
-        "top_ks": list(_JUDGE_TOP_KS),
-        "context_cap": _JUDGE_CONTEXT_CAP,
-        "summary": summary,
-    }
-    records_out = _save_judge_records(records)
-    payload["records_file"] = records_out.name
-    out = save_results("context-efficiency-judge", payload)
-    print(f"\nResults saved to {out}", file=sys.stderr)
-    print(f"Records saved to {records_out}", file=sys.stderr)
-
-
 def run_plot(args: argparse.Namespace) -> None:
     """Plot recall-vs-tokens from a saved recall-mode payload."""
     matches = sorted(_RESULTS_DIR.glob("context-efficiency-recall-*.json"))
@@ -683,12 +391,6 @@ def _parse_args() -> argparse.Namespace:
     add_filter_args(recall)
     recall.add_argument("--no-plot", action="store_true", help="Skip plotting after the run.")
     recall.set_defaults(func=run_recall)
-
-    judge = sub.add_parser("judge", help="LLM-as-judge sufficiency on a stratified sample.")
-    judge.add_argument("--sample", type=int, default=_JUDGE_DEFAULT_SAMPLE, help="Number of stratified queries.")
-    judge.add_argument("--seed", type=int, default=42, help="Random seed for sampling.")
-    judge.add_argument("--concurrency", type=int, default=_JUDGE_CONCURRENCY, help="Concurrent judge calls.")
-    judge.set_defaults(func=run_judge)
 
     plot = sub.add_parser("plot", help="Regenerate the recall-vs-tokens plot from a saved JSON.")
     plot.add_argument("--input", type=Path, default=None, help="Path to recall results (default: newest).")
