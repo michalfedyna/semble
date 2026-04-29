@@ -1,7 +1,7 @@
 
 <h2 align="center">
   <img width="30%" alt="semble logo" src="https://raw.githubusercontent.com/MinishLab/semble/main/assets/images/semble_logo.png"><br/>
-  Fast and Accurate Code Search for Agents
+  Fast and Accurate Code Search for Agents. Uses ~90% fewer tokens than grep+read.
 </h2>
 
 <div align="center">
