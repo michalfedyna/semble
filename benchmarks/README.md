@@ -4,7 +4,7 @@ Quality and speed benchmarks for `semble`.
 
 - [Main results](#main-results)
 - [By language](#by-language)
-- [Context efficiency](#context-efficiency)
+- [Token efficiency](#token-efficiency)
 - [Ablations](#ablations)
 - [Dataset](#dataset)
 - [Methods](#methods)
@@ -58,11 +58,22 @@ NDCG@10 per language, sorted by CodeRankEmbed Hybrid (CRE in the table). Best sc
 | typescript | 0.706 | **0.708** | 0.545 | 0.430 | 0.128 |
 | **overall** | **0.854** | **0.862** | **0.765** | **0.693** | **0.126** |
 
-## Context efficiency
+## Token efficiency
 
 Coding agents (Claude Code, OpenCode, etc.) typically find code by running `grep` on keywords and reading the matched files. We model that exact workflow and compare it against semble's chunk retrieval across 1,251 queries.
 
-![Recall vs. retrieved tokens](../assets/images/token_efficiency.png)
+**semble uses 98% fewer tokens than grep+read.**
+
+![Token efficiency: recall vs. retrieved tokens](../assets/images/token_efficiency.png)
+
+### Expected tokens per query
+
+For each query: tokens consumed at first relevant hit, or 32k if the method never finds anything. Averaged across all 1,251 queries.
+
+| Method | Expected tokens | Savings |
+|---|---:|---:|
+| grep + read file | 29,675 | baseline |
+| **semble** | **567** | **98% fewer** |
 
 ### Recall at fixed token budgets
 
@@ -72,15 +83,6 @@ A relevant file is "covered" once any retrieved unit comes from it.
 |---|---:|---:|---:|---:|---:|---:|---:|
 | **semble** | **0.686** | **0.849** | **0.937** | **0.976** | **0.991** | **0.996** | **0.996** |
 | grep + read file | 0.000 | 0.007 | 0.023 | 0.042 | 0.076 | 0.100 | 0.125 |
-
-### Expected tokens per query
-
-For each query: tokens consumed at first relevant hit, or 32k if the method never finds anything. Averaged across all 1,251 queries.
-
-| Method | Expected tokens | vs semble |
-|---|---:|---:|
-| **semble** | **567** | — |
-| grep + read file | 29,675 | 52× more |
 
 <details>
 <summary>Methodology</summary>
